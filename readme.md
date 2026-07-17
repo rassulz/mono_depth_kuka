@@ -18,3 +18,14 @@ My project is in Isaac Sim
 2) Then, you need to create dataset of 1000 pictures of depth and rgb, in order to in the future i could train my own computer vision model. In each picture toy car should be in different locations on the table.
 
 i have already put kuka manipulator to its proper location. and the same with table and realsense camera. The toy car is too on the table, but you will change it location on the table.
+
+
+
+-----------------
+My previous project is https://github.com/ruhalis/RealDepth
+
+where i am using general rgb camera like realsense camera with rgbd with help of ai.
+
+So, i need create a dataset for this project, in order to i could learn my model to find proper coordinates of my car, another words were good with depth.
+
+collect_isaac_sim.py is my prevous code for dataset generation, change my code in order it was good and proper for my project.
