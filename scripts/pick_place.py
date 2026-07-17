@@ -5,7 +5,9 @@ Stage 1 of the project (see readme.md / CLAUDE.md):
   - The arm moves by kinematics (resolved-rate Jacobian IK on position drives).
   - The magnetic end effector points straight down, "magnets" the car on
     contact (modeled as a kinematic attach — the car mesh has no rigid body),
-    lifts it, and puts it down at a fixed predefined place on the table.
+    lifts it, and puts it down at a fixed predefined place on the table,
+    always in the same orientation (the carry servo rotates the car about the
+    tool axis to PLACE_YAW before setting it down).
 
 Run (GUI):
     ~/isaac/venv/bin/python scripts/pick_place.py
@@ -15,7 +17,8 @@ Run (verification):
 Exits nonzero if any cycle fails its placement check.
 
 Constants below were grounded with scripts/inspect_scene.py:
-  - dof names Revolute_1..7 (7 = gripper mount, parked at 0), home q = zeros
+  - dof names Revolute_1..7 (7 = the gripper's rotary actuator, used for the
+    place-yaw task), home q = zeros
   - jacobian shape (1, 7, 6, 7), fixed base excluded -> gripper row 6,
     rows = [linear; angular], world frame
   - the working surface is the long rectangular magnet plane (0.25 x 0.054 m)
@@ -71,8 +74,11 @@ CAR = "/World/car_object_arlan_usd"
 PICK_ZONE_X = (-0.30, 0.05)
 PICK_ZONE_Y = (-0.25, 0.08)
 
-# Predefined place target for the car bbox center (world XY).
+# Predefined place target for the car bbox center (world XY) and the fixed
+# orientation the car is always set down with (0 = authored orientation).
 PLACE_XY = np.array([0.20, -0.18])
+PLACE_YAW = 0.0
+YAW_TOL = 0.03  # rad, ~1.7 deg
 
 # The magnet's working surface is the long rectangular plane of the bar
 # (0.25 x 0.054 m), perpendicular to the rotary-actuator (joint 7) axis and on
@@ -100,7 +106,7 @@ LIN_GAIN = 2.5
 ROT_GAIN = 3.0
 DLS_LAMBDA = 0.05
 GOVERNOR = 0.2        # max lead of the reference over measured joints [rad]
-NULLSPACE_W = np.array([0.0, 0.0, 0.0, 0.3, 0.3, 1.0])  # wrist-centering weights
+NULLSPACE_W = np.array([0.0, 0.0, 0.0, 0.3, 0.3, 1.0, 0.3])  # wrist-centering weights
 DOWN = np.array([0.0, 0.0, -1.0])
 
 
@@ -131,6 +137,10 @@ def quat_conj(q):
 def rot_z(theta):
     c, s = np.cos(theta), np.sin(theta)
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def wrap_angle(x):
+    return (x + np.pi) % (2 * np.pi) - np.pi
 
 
 # ----------------------------------------------------------------------------
@@ -175,7 +185,10 @@ body_names = list(view.body_names)
 ee_body_idx = body_names.index("magnetic_gripper_1")
 JAC_EE_ROW = ee_body_idx - (len(body_names) - np.asarray(view.get_jacobians()).shape[1])
 NUM_DOF = robot.num_dof
-ARM_DOFS = list(range(6))  # Revolute_1..6 drive the arm; Revolute_7 stays parked
+# Revolute_1..6 are the arm; Revolute_7 is the gripper's own rotary actuator —
+# controlled too, because J6 alone (range 6.1 rad < 2*pi) has a dead band
+# where neither rotation direction can reach the place yaw.
+ARM_DOFS = list(range(7))
 Q_HOME = np.asarray(robot.get_joint_positions(), dtype=float).copy()
 
 lim = np.asarray(view.get_dof_limits()).reshape(-1, 2)
@@ -274,8 +287,12 @@ def step_sim():
     magnet.follow()
 
 
-def servo_to(target_face_pos, pos_tol, label=""):
-    """Drive the magnet face to target_face_pos with the tool axis pointing down."""
+def servo_to(target_face_pos, pos_tol, label="", yaw_target=None):
+    """Drive the magnet face to target_face_pos with the tool axis pointing down.
+
+    With yaw_target set (and the car attached), additionally rotate about the
+    tool axis until the carried car's yaw reaches it.
+    """
     global q_ref
     target_face_pos = np.asarray(target_face_pos, dtype=float)
     for i in range(STEP_BUDGET):
@@ -283,7 +300,12 @@ def servo_to(target_face_pos, pos_tol, label=""):
         e_pos = target_face_pos - face
         a = tool_axis_world()
         dot = float(a @ DOWN)
-        if np.linalg.norm(e_pos) < pos_tol and dot > AXIS_TOL:
+        yaw_err = 0.0
+        if yaw_target is not None:
+            _, car_yaw = car_pose_now()
+            yaw_err = wrap_angle(yaw_target - car_yaw)
+        if (np.linalg.norm(e_pos) < pos_tol and dot > AXIS_TOL
+                and abs(yaw_err) < YAW_TOL):
             return True
         if dot < -0.5:
             # Antipodal escape: tool points up (zero-gradient point of the
@@ -301,14 +323,23 @@ def servo_to(target_face_pos, pos_tol, label=""):
         t1 = np.cross(a, [0.0, 0.0, 1.0] if abs(a[2]) < 0.9 else [1.0, 0.0, 0.0])
         t1 /= np.linalg.norm(t1)
         t2 = np.cross(a, t1)
-        J = np.vstack([J6[:3], t1 @ J6[3:], t2 @ J6[3:]])
-        task = np.concatenate([v, [t1 @ w, t2 @ w]])
-        JJt_inv = np.linalg.inv(J @ J.T + DLS_LAMBDA**2 * np.eye(5))
+        rows = [J6[:3], t1 @ J6[3:], t2 @ J6[3:]]
+        task = list(v) + [t1 @ w, t2 @ w]
+        if yaw_target is not None:
+            # 6th row: yaw rate about world +Z, driving the carried car toward
+            # the fixed place orientation. NOT about the tool axis — that
+            # points down (~ -Z), which would flip the sign and settle the
+            # yaw 180 deg off.
+            rows.append(J6[5])
+            task.append(np.clip(yaw_err * ROT_GAIN, -MAX_ANG_VEL, MAX_ANG_VEL))
+        J = np.vstack(rows)
+        task = np.asarray(task)
+        JJt_inv = np.linalg.inv(J @ J.T + DLS_LAMBDA**2 * np.eye(len(task)))
         dq = J.T @ JJt_inv @ task
         # nullspace bias: pull the wrist joints toward mid-range so they do
         # not camp on their limits (uses the free yaw direction)
-        q_arm = np.asarray(robot.get_joint_positions(), dtype=float)[:6]
-        N = np.eye(6) - J.T @ JJt_inv @ J
+        q_arm = np.asarray(robot.get_joint_positions(), dtype=float)[:len(ARM_DOFS)]
+        N = np.eye(len(ARM_DOFS)) - J.T @ JJt_inv @ J
         dq += N @ (NULLSPACE_W * (0.0 - q_arm))
         dq = np.clip(dq, -MAX_JOINT_VEL, MAX_JOINT_VEL)
         for k, d in enumerate(ARM_DOFS):
@@ -318,7 +349,6 @@ def servo_to(target_face_pos, pos_tol, label=""):
         qm = np.asarray(robot.get_joint_positions(), dtype=float)
         q_ref = np.clip(q_ref, qm - GOVERNOR, qm + GOVERNOR)
         q_ref = np.clip(q_ref, DOF_LOWER, DOF_UPPER)
-        q_ref[6] = Q_HOME[6]
         controller.apply_action(ArticulationAction(joint_positions=q_ref))
         step_sim()
     print(f"  [fail] servo '{label}' not converged: |err|="
@@ -385,27 +415,31 @@ for cycle in range(args.cycles):
         magnet.attach()
         print("  magnet ON", flush=True)
         place_top = TABLE_TOP_Z + 2 * CAR_HALF_HEIGHT
-        ok = (servo_to([center[0], center[1], car_top + HOVER], POS_TOL_HOVER, "lift")
+        ok = (servo_to([center[0], center[1], car_top + HOVER], POS_TOL_HOVER, "lift",
+                       yaw_target=PLACE_YAW)
               and servo_to([PLACE_XY[0], PLACE_XY[1], place_top + HOVER], POS_TOL_HOVER,
-                           "hover-place")
+                           "hover-place", yaw_target=PLACE_YAW)
               and servo_to([PLACE_XY[0], PLACE_XY[1], place_top + CONTACT_GAP],
-                           POS_TOL_CONTACT, "descend-place"))
+                           POS_TOL_CONTACT, "descend-place", yaw_target=PLACE_YAW))
         magnet.release()
         print("  magnet OFF", flush=True)
-        # settle the car exactly onto the table, keeping the yaw it landed with
+        # settle the car exactly onto the table in the predefined orientation
+        # (yaw was already servoed there; on failure keep whatever it has)
         c, yaw_now = car_pose_now()
-        set_car_center(c[:2], yaw_now)
+        set_car_center(c[:2], PLACE_YAW if ok else yaw_now)
         servo_to([PLACE_XY[0], PLACE_XY[1], place_top + HOVER], POS_TOL_HOVER, "retreat")
     else:
         magnet.release()
     park(Q_READY)
 
-    final, _ = car_pose_now()
+    final, final_yaw = car_pose_now()
     err = np.linalg.norm(final[:2] - PLACE_XY)
-    passed = bool(ok and err < PLACE_TOL)
+    yaw_err = abs(wrap_angle(final_yaw - PLACE_YAW))
+    passed = bool(ok and err < PLACE_TOL and yaw_err < YAW_TOL)
     results.append(passed)
     print(f"[cycle {cycle}] {'PASS' if passed else 'FAIL'}  "
-          f"car xy err {err * 1000:.1f} mm", flush=True)
+          f"car xy err {err * 1000:.1f} mm, yaw err {np.degrees(yaw_err):.1f} deg",
+          flush=True)
 
 n_pass = sum(results)
 print(f"\n{'=' * 50}\nRESULT: {n_pass}/{len(results)} cycles passed", flush=True)
