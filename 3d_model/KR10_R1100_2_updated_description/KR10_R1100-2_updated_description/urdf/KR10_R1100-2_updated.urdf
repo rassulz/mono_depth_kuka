@@ -1,0 +1,231 @@
+<?xml version="1.0" ?>
+<robot name="KR10_R1100-2_updated" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+<xacro:include filename="$(find KR10_R1100-2_updated_description)/urdf/materials.xacro" />
+<xacro:include filename="$(find KR10_R1100-2_updated_description)/urdf/KR10_R1100-2_updated.trans" />
+<xacro:include filename="$(find KR10_R1100-2_updated_description)/urdf/KR10_R1100-2_updated.gazebo" />
+<link name="base_link">
+  <inertial>
+    <origin xyz="0.18618317012622124 -0.15949949014661213 -0.5579339177585764" rpy="0 0 0"/>
+    <mass value="94.2994339209422"/>
+    <inertia ixx="1.096059" iyy="0.95006" izz="0.756526" ixy="-6.6e-05" iyz="0.044667" ixz="-0.000822"/>
+  </inertial>
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_1_1">
+  <inertial>
+    <origin xyz="0.002019522539135815 0.10872078233873664 0.00796882812420363" rpy="0 0 0"/>
+    <mass value="49.25911454345063"/>
+    <inertia ixx="0.393119" iyy="0.441697" izz="0.598211" ixy="-0.004043" iyz="-0.041623" ixz="8.1e-05"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.186226 0.031 0.519026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_1_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.186226 0.031 0.519026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_1_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_2_1">
+  <inertial>
+    <origin xyz="-0.05491031574332059 0.26122328495684966 -0.008324023488924304" rpy="0 0 0"/>
+    <mass value="78.8587590799443"/>
+    <inertia ixx="3.473176" iyy="0.350244" izz="3.611861" ixy="-0.007475" iyz="0.009372" ixz="0.001018"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.236726 -0.145 0.494026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_2_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.236726 -0.145 0.494026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_2_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_3_1">
+  <inertial>
+    <origin xyz="-0.06748197212618054 0.01676985304855705 0.05529826649974823" rpy="0 0 0"/>
+    <mass value="30.34731102117061"/>
+    <inertia ixx="0.239852" iyy="0.226195" izz="0.078845" ixy="-2.7e-05" iyz="-0.032718" ixz="2.4e-05"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.253726 -0.705 0.494026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_3_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.253726 -0.705 0.494026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_3_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_4_1">
+  <inertial>
+    <origin xyz="-0.00012020234393264606 -0.00041270764391043713 0.15968591192482298" rpy="0 0 0"/>
+    <mass value="30.07522579715273"/>
+    <inertia ixx="0.279705" iyy="0.309459" izz="0.074302" ixy="-0.000589" iyz="5.3e-05" ixz="0.002453"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.186226 -0.74 0.267026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_4_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.186226 -0.74 0.267026" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_4_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_5_1">
+  <inertial>
+    <origin xyz="-0.041372902547408885 -0.0012589611567804804 0.01660069877365973" rpy="0 0 0"/>
+    <mass value="3.5166770438446786"/>
+    <inertia ixx="0.004342" iyy="0.004606" izz="0.002536" ixy="3e-06" iyz="6.7e-05" ixz="-0.000137"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.22572 -0.740681 -0.044744" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_5_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.22572 -0.740681 -0.044744" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_5_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="link_6_1">
+  <inertial>
+    <origin xyz="7.68690895266988e-06 -0.00024972484174556886 0.005973236998683795" rpy="0 0 0"/>
+    <mass value="0.1092429294837037"/>
+    <inertia ixx="1.3e-05" iyy="1.3e-05" izz="2.4e-05" ixy="0.0" iyz="-0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.186266 -0.737696 -0.111204" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_6_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.186266 -0.737696 -0.111204" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/link_6_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="magnetic_gripper_1">
+  <inertial>
+    <origin xyz="9.303207100333499e-05 -0.0013815198295088482 0.03937747628884264" rpy="0 0 0"/>
+    <mass value="5.435358147781763"/>
+    <inertia ixx="0.003542" iyy="0.022204" izz="0.022103" ixy="-0.00033" iyz="3e-06" ixz="-0.000129"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.186274 -0.737229 -0.124696" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/magnetic_gripper_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.186274 -0.737229 -0.124696" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://KR10_R1100-2_updated_description/meshes/magnetic_gripper_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<joint name="Revolute 1" type="revolute">
+  <origin xyz="0.186226 -0.031 -0.519026" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="link_1_1"/>
+  <axis xyz="0.0 -1.0 -0.0"/>
+  <limit upper="2.879793" lower="-2.792527" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 2" type="revolute">
+  <origin xyz="0.0505 0.176 0.025" rpy="0 0 0"/>
+  <parent link="link_1_1"/>
+  <child link="link_2_1"/>
+  <axis xyz="-1.0 -0.0 0.0"/>
+  <limit upper="1.570796" lower="-1.832596" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 3" type="revolute">
+  <origin xyz="0.017 0.56 0.0" rpy="0 0 0"/>
+  <parent link="link_2_1"/>
+  <child link="link_3_1"/>
+  <axis xyz="-1.0 -0.0 0.0"/>
+  <limit upper="3.141593" lower="-1.134464" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 4" type="revolute">
+  <origin xyz="-0.0675 0.035 0.227" rpy="0 0 0"/>
+  <parent link="link_3_1"/>
+  <child link="link_4_1"/>
+  <axis xyz="0.0 -0.0 1.0"/>
+  <limit upper="2.617994" lower="-3.141593" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 5" type="revolute">
+  <origin xyz="0.039494 0.000681 0.31177" rpy="0 0 0"/>
+  <parent link="link_4_1"/>
+  <child link="link_5_1"/>
+  <axis xyz="-0.999851 -0.017243 0.0"/>
+  <limit upper="1.919862" lower="-1.919862" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 6" type="revolute">
+  <origin xyz="-0.039454 -0.002985 0.06646" rpy="0 0 0"/>
+  <parent link="link_5_1"/>
+  <child link="link_6_1"/>
+  <axis xyz="0.000597 -0.034639 0.9994"/>
+  <limit upper="2.96706" lower="-3.141593" effort="100" velocity="100"/>
+</joint>
+
+<joint name="Revolute 7" type="revolute">
+  <origin xyz="8e-06 -0.000467 0.013492" rpy="0 0 0"/>
+  <parent link="link_6_1"/>
+  <child link="magnetic_gripper_1"/>
+  <axis xyz="0.000597 -0.034639 0.9994"/>
+  <limit upper="3.141593" lower="-2.96706" effort="100" velocity="100"/>
+</joint>
+
+</robot>
