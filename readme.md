@@ -29,3 +29,4 @@ where i am using general rgb camera like realsense camera with rgbd with help of
 So, i need create a dataset for this project, in order to i could learn my model to find proper coordinates of my car, another words were good with depth.
 
 collect_isaac_sim.py is my prevous code for dataset generation, change my code in order it was good and proper for my project.
+

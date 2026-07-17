@@ -108,7 +108,7 @@ LIN_GAIN = 2.5
 ROT_GAIN = 3.0
 DLS_LAMBDA = 0.05
 GOVERNOR = 0.2        # max lead of the reference over measured joints [rad]
-NULLSPACE_W = np.array([0.0, 0.0, 0.0, 0.3, 0.3, 1.0, 0.3])  # wrist-centering weights
+NULLSPACE_W = np.array([0.0, 0.0, 0.0, 0.15, 0.15, 0.5, 0.15])  # wrist-centering weights
 DOWN = np.array([0.0, 0.0, -1.0])
 
 
@@ -199,12 +199,15 @@ Q_HOME = np.asarray(robot.get_joint_positions(), dtype=float).copy()
 lim = np.asarray(view.get_dof_limits()).reshape(-1, 2)
 DOF_LOWER, DOF_UPPER = lim[:, 0].copy(), lim[:, 1].copy()
 
-# The URDF-import drives are stiff but nearly undamped (zeta ~ 0.07): raise kd.
+# The URDF-import drives are extremely stiff (kp up to 1.2e6) and nearly
+# undamped (zeta ~ 0.07) -> visible end-effector vibration. Soften kp to 10%
+# and raise kd 10x: the damping ratio goes up ~30x combined, and the outer
+# servo loop absorbs the small gravity sag softer drives allow.
 kps, kds = view.get_gains()
-kps = np.asarray(kps, dtype=float).reshape(1, -1)
+kps = np.asarray(kps, dtype=float).reshape(1, -1) * 0.1
 kds = np.asarray(kds, dtype=float).reshape(1, -1) * 10.0
 view.set_gains(kps=kps, kds=kds)
-print(f"[setup] damping raised: kd = {kds.ravel()}", flush=True)
+print(f"[setup] smoothed drives: kp = {kps.ravel()}, kd = {kds.ravel()}", flush=True)
 
 controller = robot.get_articulation_controller()
 
@@ -274,6 +277,14 @@ magnet = MagneticGripper()
 # Resolved-rate IK servo (position + tool-axis-down task)
 # ----------------------------------------------------------------------------
 q_ref = Q_HOME.copy()  # integrated reference trajectory, the only thing we command
+JITTER_BUF = []        # per-step magnet-face positions, for the smoothness metric
+
+# slew-rate limits on the commanded twist: velocity ramps instead of stepping
+# at waypoint switches, which removes the largest acceleration spikes
+LIN_ACC = 0.6   # m/s^2
+ANG_ACC = 4.0   # rad/s^2
+v_cmd_prev = np.zeros(3)
+w_cmd_prev = np.zeros(3)
 
 
 def tool_axis_world():
@@ -302,6 +313,7 @@ def servo_to(target_face_pos, pos_tol, label="", yaw_target=None):
     target_face_pos = np.asarray(target_face_pos, dtype=float)
     for i in range(STEP_BUDGET):
         face = magnet_face_pos()
+        JITTER_BUF.append(face)
         e_pos = target_face_pos - face
         a = tool_axis_world()
         dot = float(a @ DOWN)
@@ -318,8 +330,12 @@ def servo_to(target_face_pos, pos_tol, label="", yaw_target=None):
             e_rot = np.array([1.0, 0.0, 0.0])
         else:
             e_rot = np.cross(a, DOWN)
+        global v_cmd_prev, w_cmd_prev
         v = np.clip(e_pos * LIN_GAIN, -MAX_LIN_VEL, MAX_LIN_VEL)
         w = np.clip(e_rot * ROT_GAIN, -MAX_ANG_VEL, MAX_ANG_VEL)
+        v = v_cmd_prev + np.clip(v - v_cmd_prev, -LIN_ACC * DT, LIN_ACC * DT)
+        w = w_cmd_prev + np.clip(w - w_cmd_prev, -ANG_ACC * DT, ANG_ACC * DT)
+        v_cmd_prev, w_cmd_prev = v, w
         jac = np.asarray(view.get_jacobians())[0, JAC_EE_ROW]  # 6 x NUM_DOF, world frame
         J6 = jac[:, ARM_DOFS]
         # Constrain only the two tilt components of the angular task: yaw about
@@ -437,6 +453,12 @@ for cycle in range(args.cycles):
         magnet.release()
     park(Q_READY)
 
+    if len(JITTER_BUF) > 2:
+        p = np.asarray(JITTER_BUF)
+        acc = np.linalg.norm(p[2:] - 2 * p[1:-1] + p[:-2], axis=1) / DT**2
+        print(f"  EE smoothness: acc rms {acc.std() + acc.mean():.2f} m/s^2, "
+              f"p95 {np.percentile(acc, 95):.2f}", flush=True)
+    JITTER_BUF.clear()
     final, final_yaw = car_pose_now()
     err = np.linalg.norm(final[:2] - PLACE_XY)
     yaw_err = abs(wrap_angle(final_yaw - PLACE_YAW))
