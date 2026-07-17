@@ -24,6 +24,7 @@ Z-up, meters. defaultPrim `/World`. Everything is already placed (do not move ro
 | `/World/KR10_R1100_2_updated` | KUKA KR10 R1100-2 articulation | base_link origin (0.093, 0.465, 1.102); articulation root API on `root_joint`; 7 revolute joints `Revolute_1..7` — 1–6 are the arm, **7 is the magnetic gripper mount** (keep at 0) |
 | `/World/car_object_arlan_usd` | toy car (static mesh, **no physics APIs**) | bbox ~0.20×0.09×0.08 m; sits on table top at z ≈ 0.836; mesh has internal offset — move it via translate delta, not absolute bbox target |
 | `/World/arlan_project_srtand_usd_updated` | table + camera stand | table top surface z ≈ 0.835; tabletop spans roughly x ∈ (−0.43, 0.78), y ∈ (−0.39, 0.77) |
+| `.../MeshInstance_11` | car-shaped tray fixture = the place target | 0.22×0.22×0.015 m at (−0.226, 0.614); the car is authored fitted in its pocket, so the authored car pose = the place pose (scripts read it at startup) |
 | `/World/Realsense` | RealSense D455 (references Nucleus cloud asset over https — needs internet) | mounted at (−0.314, −0.180, 1.374), ~0.54 m above table, looking down |
 | `/World/kr10_arm` | **stale/broken** — references nonexistent `/home/rassul_pc/Anima_project/...` path | empty Xform, harmless warning at load; ignore |
 | `/World/GroundPlane`, `/physicsScene`, `/Environment/defaultLight` | standard | |

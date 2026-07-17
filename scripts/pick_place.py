@@ -5,9 +5,9 @@ Stage 1 of the project (see readme.md / CLAUDE.md):
   - The arm moves by kinematics (resolved-rate Jacobian IK on position drives).
   - The magnetic end effector points straight down, "magnets" the car on
     contact (modeled as a kinematic attach — the car mesh has no rigid body),
-    lifts it, and puts it down at a fixed predefined place on the table,
-    always in the same orientation (the carry servo rotates the car about the
-    tool axis to PLACE_YAW before setting it down).
+    lifts it, and sets it down fitted into the car-shaped tray fixture
+    (MeshInstance_11), always in the same orientation — the place pose is read
+    from the car's authored (in-tray) pose in the scene at startup.
 
 Run (GUI):
     ~/isaac/venv/bin/python scripts/pick_place.py
@@ -74,9 +74,11 @@ CAR = "/World/car_object_arlan_usd"
 PICK_ZONE_X = (-0.30, 0.05)
 PICK_ZONE_Y = (-0.25, 0.08)
 
-# Predefined place target for the car bbox center (world XY) and the fixed
-# orientation the car is always set down with (0 = authored orientation).
-PLACE_XY = np.array([0.20, -0.18])
+# The place target is the car-shaped tray fixture (MeshInstance_11 on the
+# stand). The car is authored in the scene already fitted into that tray, so
+# its authored pose IS the place pose: PLACE_XY is read from the stage at
+# startup, and PLACE_YAW = 0 means "the authored orientation".
+PLACE_XY = None  # set after the scene is measured
 PLACE_YAW = 0.0
 YAW_TOL = 0.03  # rad, ~1.7 deg
 
@@ -169,8 +171,11 @@ car_min, car_max = np.array(car_box.GetMin()), np.array(car_box.GetMax())
 CAR_CENTER0 = (car_min + car_max) / 2.0
 CAR_HALF_HEIGHT = (car_max[2] - car_min[2]) / 2.0
 TABLE_TOP_Z = car_min[2]
+PLACE_XY = CAR_CENTER0[:2].copy()  # authored pose = fitted into the tray fixture
 print(f"[scene] car bbox center {CAR_CENTER0}, half-height {CAR_HALF_HEIGHT:.4f}, "
       f"table top z {TABLE_TOP_Z:.4f}", flush=True)
+print(f"[scene] place target (tray fixture): ({PLACE_XY[0]:+.4f}, {PLACE_XY[1]:+.4f})",
+      flush=True)
 
 world = World(stage_units_in_meters=1.0)
 robot = world.scene.add(SingleArticulation(prim_path=ROBOT, name="kr10"))
