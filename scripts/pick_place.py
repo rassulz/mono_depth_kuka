@@ -54,13 +54,16 @@ from isaacsim import SimulationApp
 # fast_shutdown would terminate the process inside close(), losing our exit code
 simulation_app = SimulationApp({"headless": args.headless, "fast_shutdown": False})
 
+import math
+
 import numpy as np
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleArticulation, SingleRigidPrim, SingleXFormPrim
 from isaacsim.core.utils.stage import open_stage
 from isaacsim.core.utils.types import ArticulationAction
+from isaacsim.sensors.camera import Camera
 import omni.usd
-from pxr import Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 # ----------------------------------------------------------------------------
 # Scene constants
@@ -190,11 +193,134 @@ print(f"[scene] car bbox center {CAR_CENTER0}, half-height {CAR_HALF_HEIGHT:.4f}
 print(f"[scene] place target (tray fixture): ({PLACE_XY[0]:+.4f}, {PLACE_XY[1]:+.4f})",
       flush=True)
 
+# The RealSense asset's own camera prims sit INSIDE the mounting-bracket
+# geometry: with their tiny near clip, a viewport bound to them renders only
+# unlit bracket interior (solid black). Raise the near plane so selecting
+# them in any GUI viewport shows the table (D455 min range is 0.4 m anyway).
+for _p in stage.Traverse():
+    if _p.GetTypeName() == "Camera" and str(_p.GetPath()).startswith("/World/Realsense"):
+        UsdGeom.Camera(_p).GetClippingRangeAttr().Set(Gf.Vec2f(0.12, 10000.0))
+
 world = World(stage_units_in_meters=1.0)
 robot = world.scene.add(SingleArticulation(prim_path=ROBOT, name="kr10"))
 gripper_body = SingleRigidPrim(prim_path=GRIPPER, name="gripper_body")
 car = SingleXFormPrim(prim_path=CAR, name="car")
+
+# --- live RealSense RGB + depth view (GUI runs only) -------------------------
+# Same proven approach as collect_isaac_sim.py: clone the pose/optics of the
+# asset's aligned Camera_Pseudo_Depth prim onto our own sensor camera (must be
+# created BEFORE world.reset() so the renderer picks up its pose).
+view_cam = None
+VIEW_W = VIEW_H = 0
+if not args.headless:
+    _ps = next((p for p in stage.Traverse()
+                if p.GetTypeName() == "Camera" and "pseudo" in p.GetName().lower()), None)
+    _W_U_INV = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
+    if _ps is not None:
+        _m = UsdGeom.XformCache().GetLocalToWorldTransform(_ps)
+        _pos = np.array(_m.ExtractTranslation())
+        _R = np.array([[_m[r][c] for c in range(3)] for r in range(3)]).T
+        _pcam = UsdGeom.Camera(_ps)
+        _focal = float(_pcam.GetFocalLengthAttr().Get() or 24.0)
+        _hap = float(_pcam.GetHorizontalApertureAttr().Get() or 20.955)
+        _vap = float(_pcam.GetVerticalApertureAttr().Get() or (_hap * 10 / 16))
+    else:
+        # offline fallback: the bare mount Xform, straight down, D455-ish FOV
+        _rs = UsdGeom.XformCache().GetLocalToWorldTransform(
+            stage.GetPrimAtPath("/World/Realsense"))
+        _pos = np.array(_rs.ExtractTranslation()) - np.array([0.0, 0.0, 0.04])
+        _q = _rs.ExtractRotationQuat()
+        _yaw = 2.0 * math.atan2(_q.GetImaginary()[2], _q.GetReal())
+        _R = rot_z(_yaw)  # USD camera at yaw-only orientation looks straight down
+        _focal, _hap = 24.0, 2.0 * 24.0 * math.tan(math.radians(45.0))
+        _vap = _hap * 10 / 16
+    VIEW_W = 424
+    VIEW_H = int(round((VIEW_W * _vap / _hap) / 2.0)) * 2
+
+    def _rot_to_quat(R):
+        w = math.sqrt(max(0.0, 1.0 + R[0, 0] + R[1, 1] + R[2, 2])) / 2.0
+        if w > 1e-8:
+            return np.array([w, (R[2, 1] - R[1, 2]) / (4 * w),
+                             (R[0, 2] - R[2, 0]) / (4 * w),
+                             (R[1, 0] - R[0, 1]) / (4 * w)])
+        i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = math.sqrt(max(1e-12, 1.0 + R[i, i] - R[j, j] - R[k, k])) * 2.0
+        q = np.zeros(4)
+        q[0] = (R[k, j] - R[j, k]) / s
+        q[1 + i] = s / 4.0
+        q[1 + j] = (R[j, i] + R[i, j]) / s
+        q[1 + k] = (R[k, i] + R[i, k]) / s
+        return q
+
+    view_cam = Camera(
+        prim_path="/World/PickPlaceViewCam",
+        position=_pos,
+        orientation=_rot_to_quat(_R @ _W_U_INV),
+        resolution=(VIEW_W, VIEW_H),
+    )
+
 world.reset()
+
+_view_ui = {}
+if view_cam is not None:
+    view_cam.initialize()
+    view_cam.add_distance_to_image_plane_to_frame()
+    _vc = UsdGeom.Camera(stage.GetPrimAtPath("/World/PickPlaceViewCam"))
+    _vc.GetFocalLengthAttr().Set(_focal)
+    _vc.GetHorizontalApertureAttr().Set(_hap)
+    _vc.GetVerticalApertureAttr().Set(_hap * VIEW_H / float(VIEW_W))
+    _vc.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 100.0))  # NOT the 1 m default
+    try:
+        import omni.ui as ui
+        _view_ui["rgb"] = ui.ByteImageProvider()
+        _view_ui["depth"] = ui.ByteImageProvider()
+        _win = ui.Window("RealSense View", width=VIEW_W + 24,
+                         height=2 * VIEW_H + 90)
+        with _win.frame:
+            with ui.VStack(spacing=4):
+                ui.Label("RGB", height=18)
+                ui.ImageWithProvider(_view_ui["rgb"], height=VIEW_H)
+                ui.Label("Depth (bright = near)", height=18)
+                ui.ImageWithProvider(_view_ui["depth"], height=VIEW_H)
+        _view_ui["win"] = _win
+        print("[view] RealSense View window ready (RGB + depth)", flush=True)
+    except Exception as e:
+        print(f"[view] UI window unavailable: {e}", flush=True)
+        _view_ui.clear()
+
+_view_step = [0]
+
+
+def _view_tick():
+    """Push fresh RGB + colorized depth into the RealSense View window."""
+    _view_step[0] += 1
+    if not _view_ui or _view_step[0] % 6:
+        return
+    try:
+        rgba = view_cam.get_rgba()
+        depth = view_cam.get_depth()
+        if rgba is None or depth is None or np.asarray(rgba).size == 0:
+            return
+        rgba = np.asarray(rgba)
+        if rgba.dtype != np.uint8:
+            rgba = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
+        if rgba.shape[2] == 3:
+            rgba = np.dstack([rgba, np.full(rgba.shape[:2], 255, np.uint8)])
+        _view_ui["rgb"].set_bytes_data(rgba.flatten().tolist(),
+                                       [rgba.shape[1], rgba.shape[0]])
+        d = np.where(np.isfinite(depth), depth, 0.0)
+        # workspace band 0.3-1.0 m mapped bright(near) -> dark(far)
+        u8 = (255 * (1.0 - np.clip((d - 0.3) / 0.7, 0, 1))).astype(np.uint8)
+        u8[d <= 0.05] = 0
+        drgba = np.dstack([u8, u8, u8, np.full(u8.shape, 255, np.uint8)])
+        _view_ui["depth"].set_bytes_data(drgba.flatten().tolist(),
+                                         [u8.shape[1], u8.shape[0]])
+    except Exception as e:
+        print(f"[view] disabled after error: {e}", flush=True)
+        _view_ui.clear()
+
+
 gripper_body.initialize(world.physics_sim_view)
 car.initialize(world.physics_sim_view)
 
@@ -314,6 +440,8 @@ def magnet_face_pos():
 def step_sim():
     world.step(render=not args.headless)
     magnet.follow()
+    if view_cam is not None:
+        _view_tick()
 
 
 def servo_to(target_face_pos, pos_tol, label="", yaw_target=None):
