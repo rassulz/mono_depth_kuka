@@ -107,9 +107,16 @@ REALSENSE = "/World/Realsense"
 CAM_PATH = "/World/DatasetCamera"
 
 # Tabletop and rig geometry (grounded by scripts/inspect_scene.py, see CLAUDE.md)
-TABLE_X = (-0.427, 0.780)
-TABLE_Y = (-0.387, 0.767)
-TABLE_MARGIN = 0.12          # keep the whole car on the table
+# The tabletop SHEET (MeshInstance_9), NOT the whole stand bbox — the stand
+# extends to y=-0.387 (side electrical box) and x=-0.427 (camera bracket),
+# and sampling that larger box spawned cars floating in the air beside the
+# table.
+TABLE_X = (-0.38, 0.78)
+TABLE_Y = (-0.213, 0.767)
+# margin keeping the WHOLE car on the tabletop: half-extent + 1 cm slack;
+# the yaw-0 car is 0.20 x 0.09 m, with --random_yaw use the half-diagonal
+TABLE_MARGIN_X = 0.12 if args.random_yaw else 0.11
+TABLE_MARGIN_Y = 0.12 if args.random_yaw else 0.055
 TRAY_X = (-0.34, -0.11)      # tray fixture bbox + margin: don't drop the car onto it
 TRAY_Y = (0.50, 0.73)
 ROBOT_X = (0.40, 0.90)       # robot column footprint + margin
@@ -321,8 +328,8 @@ def sample_car_xy():
     pad_u = CAR_HALF_DIAG_MARGIN * FX / (CAM_T[2] - TABLE_TOP_Z)
     pad_v = CAR_HALF_DIAG_MARGIN * FY / (CAM_T[2] - TABLE_TOP_Z)
     for _ in range(1000):
-        x = rng.uniform(TABLE_X[0] + TABLE_MARGIN, TABLE_X[1] - TABLE_MARGIN)
-        y = rng.uniform(TABLE_Y[0] + TABLE_MARGIN, TABLE_Y[1] - TABLE_MARGIN)
+        x = rng.uniform(TABLE_X[0] + TABLE_MARGIN_X, TABLE_X[1] - TABLE_MARGIN_X)
+        y = rng.uniform(TABLE_Y[0] + TABLE_MARGIN_Y, TABLE_Y[1] - TABLE_MARGIN_Y)
         # inside the camera view at table height, margin so the whole car fits
         u, v, _ = project_to_pixel([x, y, TABLE_TOP_Z])
         if not (pad_u <= u < WIDTH - pad_u and pad_v <= v < HEIGHT - pad_v):
@@ -457,7 +464,9 @@ def capture_validated(center_xy, yaw):
         return None, None
 
     for attempt in range(4):
-        sub = 8 + attempt * 8
+        # start at 16 subframes: at 8 the path-tracing accumulation missed
+        # the visibility toggle in ~84% of frames, wasting a full retry loop
+        sub = 16 + attempt * 16
         # phase 1: car hidden + beacon RED -> a capture showing RED is a
         # provably fresh car-free background
         car_img.MakeInvisible()
@@ -502,10 +511,17 @@ def capture_validated(center_xy, yaw):
         beacon_zone = ((xs - BEACON_PX[0]) ** 2 + (ys - BEACON_PX[1]) ** 2 < 45 ** 2)
         outside = float(changed[~car_zone & ~beacon_zone].mean())
         core = changed[max(0, iv - 35):iv + 36, max(0, iu - 35):iu + 36]
-        car_visible = float(core.mean()) > 0.06
-        if depth_ok and car_visible and outside < 0.01 and float(rgb_bgr.mean()) >= 5.0:
+        # diagnostic only: the white car on the white table often changes RGB
+        # by less than the threshold (low contrast), while depth_ok on the
+        # SAME capture already proves the car is rendered at its label and
+        # the beacon protocol proves freshness — so low RGB contrast must not
+        # reject the frame (it aborted a run at frame 356 doing that)
+        car_low_contrast = float(core.mean()) <= 0.06
+        if depth_ok and outside < 0.01 and float(rgb_bgr.mean()) >= 5.0:
+            if car_low_contrast:
+                log(f"  note: car has low RGB contrast here (depth confirms it)")
             return rgb_bgr, depth_mm, center, u, v, cam_depth, float(valid.min())
-        log(f"  gate: depth_ok={depth_ok} car_visible={car_visible} "
+        log(f"  gate: depth_ok={depth_ok} low_contrast={car_low_contrast} "
             f"outside_frac={outside:.4f} (attempt {attempt + 1})")
     return None
 

@@ -43,7 +43,7 @@ import os
 
 parser = argparse.ArgumentParser(description="KR10 magnetic pick-and-place")
 parser.add_argument("--headless", action="store_true")
-parser.add_argument("--cycles", type=int, default=5, help="number of pick-place cycles")
+parser.add_argument("--cycles", type=int, default=10, help="number of pick-place cycles")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--corners", action="store_true",
                     help="pick-zone corners for the first 4 cycles (worst-case reach test)")
@@ -70,11 +70,22 @@ ROBOT = "/World/KR10_R1100_2_updated"
 GRIPPER = ROBOT + "/magnetic_gripper_1"
 CAR = "/World/car_object_arlan_usd"
 
-# Region on the table where the car may appear (bbox-center coordinates, world).
-# Inside the RealSense D455 view cone (camera nadir ~(-0.31, -0.18)) and within
-# comfortable arm reach of axis 1 at (-0.03, 0.28).
-PICK_ZONE_X = (-0.30, 0.05)
-PICK_ZONE_Y = (-0.25, 0.08)
+# Region on the table where the car may appear (bbox-center coordinates,
+# world) — most of the usable tabletop. The sampler additionally rejects
+# spots too close to / too far from axis 1 at (-0.03, 0.28), the tray
+# fixture, and the previous spawn (so consecutive cars land visibly apart).
+# Bounds derive from the tabletop SHEET (x -0.38..0.78, y -0.213..0.767 —
+# NOT the stand bbox, whose side box/bracket extend further and would let
+# the car spawn floating in the air beside the table) minus the car's
+# half-extents, intersected with the reach annulus below.
+PICK_ZONE_X = (-0.27, 0.35)
+PICK_ZONE_Y = (-0.16, 0.08)
+AXIS1_XY = np.array([-0.03, 0.28])
+REACH_MIN = 0.30      # can't pick directly under the robot's own axis
+REACH_MAX = 0.68      # verified reach envelope for tool-down picks
+TRAY_ZONE_X = (-0.36, -0.09)  # tray fixture + margin: never spawn on it
+TRAY_ZONE_Y = (0.46, 0.75)
+MIN_SPREAD = 0.18     # min distance between consecutive spawns [m]
 
 # The place target is the car-shaped tray fixture (MeshInstance_11 on the
 # stand). The car is authored in the scene already fitted into that tray, so
@@ -395,12 +406,28 @@ def park(q_target, steps=240):
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
+_last_spawn = [None]
+
+
 def random_car_xy(cycle):
     if args.corners and cycle < 4:
         corners = [(PICK_ZONE_X[0], PICK_ZONE_Y[0]), (PICK_ZONE_X[0], PICK_ZONE_Y[1]),
                    (PICK_ZONE_X[1], PICK_ZONE_Y[0]), (PICK_ZONE_X[1], PICK_ZONE_Y[1])]
         return np.array(corners[cycle])
-    return np.array([rng.uniform(*PICK_ZONE_X), rng.uniform(*PICK_ZONE_Y)])
+    for _ in range(500):
+        xy = np.array([rng.uniform(*PICK_ZONE_X), rng.uniform(*PICK_ZONE_Y)])
+        r = np.linalg.norm(xy - AXIS1_XY)
+        if not (REACH_MIN <= r <= REACH_MAX):
+            continue
+        if TRAY_ZONE_X[0] <= xy[0] <= TRAY_ZONE_X[1] and \
+                TRAY_ZONE_Y[0] <= xy[1] <= TRAY_ZONE_Y[1]:
+            continue
+        if _last_spawn[0] is not None and \
+                np.linalg.norm(xy - _last_spawn[0]) < MIN_SPREAD:
+            continue
+        _last_spawn[0] = xy
+        return xy
+    raise RuntimeError("random_car_xy: no valid spawn found — check zones")
 
 
 for _ in range(30):  # settle
