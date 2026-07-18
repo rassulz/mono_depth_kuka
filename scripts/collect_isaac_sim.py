@@ -1,22 +1,33 @@
-"""
-Isaac Sim Synthetic Dataset Collection for RealDepth — Diverse Edition
+"""Isaac Sim RGB-D dataset collection for the KUKA pick-and-place project.
 
-Loads multiple USD scenes, spawns random objects (primitives + Nucleus mesh assets),
-randomizes lighting and materials, and moves a camera on random trajectories
-to collect RGB + depth frame pairs with maximum domain diversity.
+Adapted from RealDepth's scripts/collect_isaac_sim.py (the diverse-domain
+collector) for this project's fixed deployment rig:
+  - one fixed scene: isaac_version_project_anima.usd (table, KR10, tray, car)
+  - the camera is NOT on a random walk — it sits at the authored RealSense
+    D455 mount pose above the table (45 deg yaw, looking straight down),
+    with D455 RGB geometry (90 x 65 deg FOV, 16:10)
+  - instead of spawning random objects, the toy car teleports to a different
+    spot on the table for every frame (uniform over the camera-visible,
+    reachable tabletop, keeping the whole car in frame); its orientation stays
+    fixed at the authored, tray-fitting yaw (the vision model only outputs
+    position) unless --random_yaw is passed
+  - mild indoor lighting randomization (can be disabled), no material swaps
+  - physics is never stepped (render-only), so the arm stays parked upright
+  - NEW: labels.json with ground-truth car pose per frame (world xyz + yaw +
+    pixel coordinates + depth), for training the car-coordinate model
 
-Usage (run from Isaac Sim's python):
-    /home/nurtay/isaacsim/python.sh scripts/collect_isaac_sim.py \
-        --usd_paths warehouse.usd digtwin.usd hospital.usd \
-        --num_frames 5000 \
-        --output_dir collected_dataset/isaac_diverse
+Output layout (unchanged, consumed by RealDepth's split_dataset.py):
+  <out>/rgb/NNNNNN.png          8-bit BGR
+  <out>/depth/NNNNNN.png        uint16, millimetres, 0 = invalid
+  <out>/intrinsics.json         per-frame {stem: {fx fy cx cy width height}}
+  <out>/intrinsics.txt          human-readable summary
+  <out>/labels.json             per-frame ground-truth car pose (extra file)
 
-    # Single scene (backward-compatible):
-    /home/nurtay/isaacsim/python.sh scripts/collect_isaac_sim.py \
-        --usd_path warehouse.usd --num_frames 3000
-
-    # No scene (procedural fallback):
-    /home/nurtay/isaacsim/python.sh scripts/collect_isaac_sim.py --headless --num_frames 3000
+Usage:
+    ~/isaac/venv/bin/python scripts/collect_isaac_sim.py --headless \
+        --num_frames 1000 --seed 0
+    # quick self-check (captures a few frames, verifies GT projection):
+    ~/isaac/venv/bin/python scripts/collect_isaac_sim.py --headless --test
 """
 
 import argparse
@@ -29,69 +40,83 @@ from pathlib import Path
 import numpy as np
 
 # ---- Parse args BEFORE SimulationApp (it consumes some args) ----
-parser = argparse.ArgumentParser(description="Collect diverse RGB-D dataset in Isaac Sim")
-parser.add_argument("--usd_path", type=str, default="",
-                    help="Path to a single USD scene file (backward compat).")
-parser.add_argument("--usd_paths", type=str, nargs="*", default=[],
-                    help="Paths to multiple USD scene files. The collector "
-                         "cycles through them for scene-level diversity.")
+parser = argparse.ArgumentParser(description="Collect KUKA-scene RGB-D dataset")
 parser.add_argument("--output_dir", type=str, default="",
-                    help="Output directory (default: collected_dataset/<timestamp>)")
-parser.add_argument("--num_frames", type=int, default=3000,
-                    help="Total number of frames to collect")
+                    help="Output directory (default: collected_dataset/kuka_<timestamp>)")
+parser.add_argument("--num_frames", type=int, default=1000)
 parser.add_argument("--width", type=int, default=640,
-                    help="Base image width (used as resolution budget when "
-                         "randomizing aspect ratio)")
-parser.add_argument("--height", type=int, default=480,
-                    help="Fallback image height (used when aspect randomization is off)")
-parser.add_argument("--fov_range", type=float, nargs=2, default=[50.0, 100.0],
-                    help="Min / max horizontal FOV in degrees, sampled per scene")
-parser.add_argument("--aspect_ratios", type=float, nargs="+",
-                    default=[1.3333, 1.7778, 1.0, 0.75],
-                    help="Set of width/height aspect ratios sampled per scene")
-parser.add_argument("--scene_gap", type=int, default=50,
-                    help="Frame-number gap inserted between scenes so "
-                         "SequenceDataset/split_dataset treat each scene as a "
-                         "separate sequence (one camera per sequence)")
-parser.add_argument("--num_objects", type=int, default=40,
-                    help="Number of random objects to spawn per scene")
-parser.add_argument("--fps", type=int, default=30,
-                    help="Simulation step rate")
-parser.add_argument("--headless", action="store_true",
-                    help="Run in headless mode (no GUI)")
-parser.add_argument("--max_depth_mm", type=int, default=10000,
-                    help="Max depth clamp in mm (default 10000 = 10 m)")
-parser.add_argument("--camera_height_range", type=float, nargs=2,
-                    default=[0.5, 2.5],
-                    help="Min / max camera height in metres")
-parser.add_argument("--arena_size", type=float, default=15.0,
-                    help="Half-size of the arena the camera can roam (metres)")
-parser.add_argument("--frames_per_scene", type=int, default=0,
-                    help="Frames to collect per scene before switching. "
-                         "0 = evenly split num_frames across scenes.")
-parser.add_argument("--light_randomize_interval", type=int, default=10,
-                    help="Re-randomize lighting every N frames")
-parser.add_argument("--object_randomize_interval", type=int, default=50,
-                    help="Re-randomize object poses every N frames")
-parser.add_argument("--use_nucleus_assets", action="store_true",
-                    help="Try to load mesh assets from Isaac Sim Nucleus")
+                    help="Image width; height follows the D455 16:10 aspect")
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--headless", action="store_true")
+parser.add_argument("--max_depth_mm", type=int, default=10000)
+parser.add_argument("--light_randomize_interval", type=int, default=25,
+                    help="Re-randomize lighting every N frames (0 = never)")
+parser.add_argument("--settle_renders", type=int, default=6,
+                    help="Render-only updates after each car move before capture")
+parser.add_argument("--random_yaw", action="store_true",
+                    help="Randomize the car's yaw per frame. Default is OFF: the "
+                         "vision model only outputs position, so the car always "
+                         "keeps its authored (tray-fitting) orientation")
+parser.add_argument("--test", action="store_true",
+                    help="Capture 8 frames and verify GT labels against the "
+                         "rendered depth instead of collecting the full set")
 args, unknown = parser.parse_known_args()
-
-# Merge --usd_path into --usd_paths for unified handling
-if args.usd_path and args.usd_path not in args.usd_paths:
-    args.usd_paths.insert(0, args.usd_path)
 
 # ---- Launch Isaac Sim ----
 from isaacsim import SimulationApp
+
 simulation_app = SimulationApp({"headless": args.headless})
 
-# Now safe to import Omniverse / Isaac Sim modules
-import isaacsim.core.utils.numpy.rotations as rot_utils
+# Render with PATH TRACING, not the real-time (RTX) mode: the real-time
+# denoiser keeps per-pixel radiance history that leaves semi-transparent
+# "ghost" copies of the car at its previous positions for dozens of frames
+# after a teleport (survives AA/DLSS being disabled). Path tracing
+# accumulates samples only within a frame — no cross-frame history, no
+# ghosts — and gives cleaner lighting for the dataset.
+import carb.settings
+
+_s = carb.settings.get_settings()
+_s.set("/rtx/rendermode", "PathTracing")
+_s.set("/rtx/pathtracing/spp", 256)
+_s.set("/rtx/pathtracing/totalSpp", 256)
+_s.set("/rtx/pathtracing/clampSpp", 256)
+# The PT denoiser is TEMPORAL (previous output bleeds into new frames);
+# disabled, 256 spp keeps noise low.
+_s.set("/rtx/pathtracing/optixDenoiser/enabled", False)
+# MOTION BLUR is the root cause of the "transparent extra cars": a teleport
+# is a huge instantaneous velocity, so the renderer smears the car across the
+# shutter — semi-transparent copies at old positions, in RGB only (depth AOVs
+# are not motion blurred, which is why depth was always clean).
+_s.set("/rtx/post/motionblur/enabled", False)
+_s.set("/rtx/pathtracing/mbEnabled", False)
+_s.set("/omni/replicator/captureMotionBlur", False)
+
 from isaacsim.core.api import World
+from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.utils.stage import open_stage
 from isaacsim.sensors.camera import Camera
-from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade
+import omni.replicator.core as rep
+import omni.usd
+from pxr import Gf, Usd, UsdGeom, UsdLux
 
 import cv2
+
+SCENE = "/home/rassul_pc/mono_depth_kuka/isaac_version_project_anima.usd"
+CAR = "/World/car_object_arlan_usd"
+REALSENSE = "/World/Realsense"
+CAM_PATH = "/World/DatasetCamera"
+
+# Tabletop and rig geometry (grounded by scripts/inspect_scene.py, see CLAUDE.md)
+TABLE_X = (-0.427, 0.780)
+TABLE_Y = (-0.387, 0.767)
+TABLE_MARGIN = 0.12          # keep the whole car on the table
+TRAY_X = (-0.34, -0.11)      # tray fixture bbox + margin: don't drop the car onto it
+TRAY_Y = (0.50, 0.73)
+ROBOT_X = (0.40, 0.90)       # robot column footprint + margin
+ROBOT_Y = (0.07, 0.49)
+CAR_HALF_DIAG_MARGIN = 0.16  # keep the whole car inside the camera view
+                             # (sized for tilted views too, where the
+                             # metre-to-pixel scale varies across the frame)
 
 
 def log(msg):
@@ -99,717 +124,499 @@ def log(msg):
     sys.stderr.flush()
 
 
+def quat_to_rot(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def rot_z(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
 # ---------------------------------------------------------------------------
-# Nucleus mesh asset helpers
+# Scene setup (render-only: physics is never stepped, the arm stays parked)
 # ---------------------------------------------------------------------------
+open_stage(SCENE)
+stage = omni.usd.get_context().get_stage()
 
-# Common Isaac Sim Nucleus asset paths (available in most installations)
-NUCLEUS_ASSET_PATHS = [
-    "/Isaac/Props/Blocks/basic_block.usd",
-    "/Isaac/Props/Mounts/ThorlabsTable/table_instanceable.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxA_01.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxB_01.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxC_01.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_CardBoxD_01.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_PaletteA_01.usd",
-    "/Isaac/Environments/Simple_Warehouse/Props/SM_BarelPlastic_A_01.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/004_sugar_box.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/005_tomato_soup_can.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/006_mustard_bottle.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/007_tuna_fish_can.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/008_pudding_box.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/009_gelatin_box.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/010_potted_meat_can.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/011_banana.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/019_pitcher_base.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/021_bleach_cleanser.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/024_bowl.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/025_mug.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/035_power_drill.usd",
-    "/Isaac/Props/YCB/Axis_Aligned/037_scissors.usd",
-]
+bbc = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+car_prim = stage.GetPrimAtPath(CAR)
+car_box = bbc.ComputeWorldBound(car_prim).ComputeAlignedRange()
+car_min, car_max = np.array(car_box.GetMin()), np.array(car_box.GetMax())
+CAR_CENTER0 = (car_min + car_max) / 2.0
+CAR_HALF_HEIGHT = (car_max[2] - car_min[2]) / 2.0
+TABLE_TOP_Z = car_min[2]
 
-# Additional Nucleus paths to search for available assets
-NUCLEUS_SEARCH_DIRS = [
-    "/Isaac/Props/",
-    "/Isaac/Environments/Simple_Warehouse/Props/",
-    "/Isaac/Props/YCB/Axis_Aligned/",
-]
+# Camera pose: replicate the RealSense asset's Camera_Pseudo_Depth prim (the
+# user aligned it to the intended view). It lives inside the cloud-referenced
+# RSD455 asset, so it only exists on the composed stage at runtime.
+pseudo_prim = None
+for p in stage.Traverse():
+    if p.GetTypeName() == "Camera" and "pseudo" in p.GetName().lower():
+        pseudo_prim = p
+        break
+if pseudo_prim is None:
+    log("FATAL: no *pseudo* Camera prim found under the RealSense asset — "
+        "did the cloud asset load (needs internet)?")
+    simulation_app.close()
+    import os
+    os._exit(3)
+
+ps_cache = UsdGeom.XformCache()
+ps_m = ps_cache.GetLocalToWorldTransform(pseudo_prim)
+CAM_POS = np.array(ps_m.ExtractTranslation())
+R_USD_TARGET = np.array([[ps_m[r][c] for c in range(3)] for r in range(3)]).T
+log(f"replicating {pseudo_prim.GetPath()}: pos {CAM_POS.round(4)}, "
+    f"view dir {(-R_USD_TARGET[:, 2]).round(3)}")
+
+# Copy its FOV too (D455 depth geometry), keeping square pixels.
+ps_cam = UsdGeom.Camera(pseudo_prim)
+PS_FOCAL = float(ps_cam.GetFocalLengthAttr().Get() or 24.0)
+PS_HAP = float(ps_cam.GetHorizontalApertureAttr().Get() or 20.955)
+PS_VAP = float(ps_cam.GetVerticalApertureAttr().Get() or (PS_HAP * 10 / 16))
+log(f"pseudo-depth camera optics: focal {PS_FOCAL}, aperture {PS_HAP} x {PS_VAP}")
+
+# Resolution follows the pseudo-depth camera's aspect ratio (square pixels).
+WIDTH = int(round(args.width / 2.0)) * 2
+HEIGHT = int(round((WIDTH * PS_VAP / PS_HAP) / 2.0)) * 2
+
+world = World(stage_units_in_meters=1.0)
+car = SingleXFormPrim(prim_path=CAR, name="car")
 
 
-def _try_get_nucleus_server():
-    """Try to find the default Nucleus server URL."""
-    try:
-        import omni.client
-        # Try common Nucleus server URLs
-        for server in ["omniverse://localhost", "omniverse://nucleus"]:
-            result, _ = omni.client.stat(server)
-            if result == omni.client.Result.OK:
-                return server
-    except Exception:
-        pass
+def rot_to_quat(R):
+    w = math.sqrt(max(0.0, 1.0 + R[0, 0] + R[1, 1] + R[2, 2])) / 2.0
+    if w > 1e-8:
+        return np.array([w, (R[2, 1] - R[1, 2]) / (4 * w),
+                         (R[0, 2] - R[2, 0]) / (4 * w),
+                         (R[1, 0] - R[0, 1]) / (4 * w)])
+    # trace near -1 (180 deg rotation): use the largest-diagonal branch
+    i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+    j, k = (i + 1) % 3, (i + 2) % 3
+    s = math.sqrt(max(1e-12, 1.0 + R[i, i] - R[j, j] - R[k, k])) * 2.0
+    q = np.zeros(4)
+    q[0] = (R[k, j] - R[j, k]) / s
+    q[1 + i] = s / 4.0
+    q[1 + j] = (R[j, i] + R[i, j]) / s
+    q[1 + k] = (R[k, i] + R[i, k]) / s
+    return q
+
+
+# The camera pose must exist BEFORE world.reset() so the renderer picks it up
+# (late set_world_pose writes were not reflected in renders). The constructor
+# routes orientation through set_world_pose with camera_axes="world"
+# (+X forward, +Z image-up), so convert the target USD-frame rotation:
+# R_in = R_usd_target @ inv(W_U_TRANSFORM).
+W_U_INV = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
+camera = Camera(
+    prim_path=CAM_PATH,
+    position=CAM_POS,
+    orientation=rot_to_quat(R_USD_TARGET @ W_U_INV),
+    resolution=(WIDTH, HEIGHT),
+)
+world.reset()
+car.initialize(world.physics_sim_view)
+camera.initialize()
+camera.add_distance_to_image_plane_to_frame()
+
+# Copy the pseudo-depth camera's optics (FOV) onto the render camera.
+cam_usd = UsdGeom.Camera(stage.GetPrimAtPath(CAM_PATH))
+cam_usd.GetFocalLengthAttr().Set(PS_FOCAL)
+cam_usd.GetHorizontalApertureAttr().Set(PS_HAP)
+cam_usd.GetVerticalApertureAttr().Set(PS_HAP * HEIGHT / float(WIDTH))
+# CRITICAL: a fresh USD Camera prim falls back to clippingRange (1, 1e6) —
+# 1 METER near plane in this stage, which clips away the whole table scene
+# (the camera is only ~0.5 m above it). D455 min range is ~0.4 m, but keep
+# the near plane tiny so nothing in the rig ever clips.
+cam_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 100.0))
+
+for _ in range(10):  # let the renderer warm up
+    world.render()
+
+# Intrinsics (read back, with FOV fallback like the original collector)
+try:
+    m = camera.get_intrinsics_matrix()
+    FX, FY = float(m[0, 0]), float(m[1, 1])
+    CX, CY = float(m[0, 2]), float(m[1, 2])
+except Exception:
+    FX = FY = WIDTH * PS_FOCAL / PS_HAP
+    CX, CY = WIDTH / 2.0, HEIGHT / 2.0
+INTR = {"fx": FX, "fy": FY, "cx": CX, "cy": CY, "width": WIDTH, "height": HEIGHT}
+log(f"intrinsics: fx={FX:.2f} fy={FY:.2f} cx={CX:.2f} cy={CY:.2f} {WIDTH}x{HEIGHT}")
+
+# Camera extrinsics in the ROS optical convention (+Z forward, +X right,
+# +Y down), derived from the SAME USD transform the renderer uses.
+# Gf matrices are row-vector convention: row i = image of basis vector i,
+# so the USD-frame axis columns are the transposed rotation block.
+cam_m = UsdGeom.XformCache().GetLocalToWorldTransform(stage.GetPrimAtPath(CAM_PATH))
+R_usd = np.array([[cam_m[r][c] for c in range(3)] for r in range(3)]).T
+CAM_T = np.array(cam_m.ExtractTranslation())
+# ROS optical axes from USD camera axes: x=+X, y=-Y (down), z=-Z (forward)
+CAM_R = R_usd @ np.diag([1.0, -1.0, -1.0])  # optical -> world
+
+
+def project_to_pixel(p_world):
+    pc = CAM_R.T @ (np.asarray(p_world, dtype=float) - CAM_T)
+    u = FX * pc[0] / pc[2] + CX
+    v = FY * pc[1] / pc[2] + CY
+    return float(u), float(v), float(pc[2])
+
+
+# ---------------------------------------------------------------------------
+# Car placement (same bookkeeping as pick_place.py)
+# ---------------------------------------------------------------------------
+# Move the car by writing its USD xform attributes DIRECTLY: the Isaac
+# set_world_pose path writes through Fabric, which the render pipeline's
+# change-detection can miss — the accumulation then never resets and keeps a
+# semi-transparent copy of the car at its old position. Plain USD writes fire
+# notices that Hydra reliably picks up. (Re-fetch the stage: the pre-World
+# handle can go stale, see CLAUDE.md.)
+stage_live = omni.usd.get_context().get_stage()
+_car_xf_ops = {op.GetOpName(): op
+               for op in UsdGeom.Xformable(stage_live.GetPrimAtPath(CAR)).GetOrderedXformOps()}
+_op_t = _car_xf_ops["xformOp:translate"]
+_op_o = _car_xf_ops["xformOp:orient"]
+_T_DOUBLE = _op_t.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
+_O_DOUBLE = _op_o.GetPrecision() == UsdGeom.XformOp.PrecisionDouble
+
+
+def _write_car_pose_usd(pos, quat_wxyz):
+    w, x, y, z = (float(a) for a in quat_wxyz)
+    _op_t.Set(Gf.Vec3d(*pos) if _T_DOUBLE else Gf.Vec3f(*[float(a) for a in pos]))
+    _op_o.Set(Gf.Quatd(w, x, y, z) if _O_DOUBLE else Gf.Quatf(w, x, y, z))
+
+
+car_pos0, car_quat0 = car.get_world_pose()
+car_pos0 = np.asarray(car_pos0, dtype=float)
+CAR_QUAT0 = np.asarray(car_quat0, dtype=float)
+CAR_OFFSET0 = CAR_CENTER0 - car_pos0
+
+rng = np.random.default_rng(args.seed)
+
+
+def set_car_center(center_xy, yaw, z_bottom=TABLE_TOP_Z):
+    center = np.array([center_xy[0], center_xy[1], z_bottom + CAR_HALF_HEIGHT])
+    pos = center - rot_z(yaw) @ CAR_OFFSET0
+    q_yaw = np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+    w1, x1, y1, z1 = q_yaw
+    w2, x2, y2, z2 = CAR_QUAT0
+    q = np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+    _write_car_pose_usd(pos, q)
+    return center
+
+
+def sample_car_xy():
+    """Uniform over the tabletop, whole car inside the camera view, away from
+    the tray fixture and the robot column. Rejection sampling."""
+    pad_u = CAR_HALF_DIAG_MARGIN * FX / (CAM_T[2] - TABLE_TOP_Z)
+    pad_v = CAR_HALF_DIAG_MARGIN * FY / (CAM_T[2] - TABLE_TOP_Z)
+    for _ in range(1000):
+        x = rng.uniform(TABLE_X[0] + TABLE_MARGIN, TABLE_X[1] - TABLE_MARGIN)
+        y = rng.uniform(TABLE_Y[0] + TABLE_MARGIN, TABLE_Y[1] - TABLE_MARGIN)
+        # inside the camera view at table height, margin so the whole car fits
+        u, v, _ = project_to_pixel([x, y, TABLE_TOP_Z])
+        if not (pad_u <= u < WIDTH - pad_u and pad_v <= v < HEIGHT - pad_v):
+            continue
+        if TRAY_X[0] <= x <= TRAY_X[1] and TRAY_Y[0] <= y <= TRAY_Y[1]:
+            continue
+        if ROBOT_X[0] <= x <= ROBOT_X[1] and ROBOT_Y[0] <= y <= ROBOT_Y[1]:
+            continue
+        return np.array([x, y])
+    raise RuntimeError("sample_car_xy: rejection sampling failed — check zones")
+
+
+# ---------------------------------------------------------------------------
+# Mild indoor lighting randomization (no material swaps, no object spawns)
+# ---------------------------------------------------------------------------
+def setup_lights():
+    dome = UsdLux.DomeLight.Define(stage, "/World/Lights/DomeLight")
+    dome.CreateIntensityAttr(500.0)
+    dist = UsdLux.DistantLight.Define(stage, "/World/Lights/DistantLight")
+    dist.CreateIntensityAttr(1000.0)
+    UsdGeom.Xformable(dist.GetPrim()).AddRotateXYZOp().Set(Gf.Vec3f(-50.0, 20.0, 0.0))
+
+
+def randomize_lighting():
+    # ranges tuned low: these stack on the scene's own default light, and the
+    # mostly-white table overexposes easily
+    dome = UsdLux.DomeLight(stage.GetPrimAtPath("/World/Lights/DomeLight"))
+    dome.GetIntensityAttr().Set(float(rng.uniform(100, 1200)))
+    dome.GetColorAttr().Set(Gf.Vec3f(
+        1.0, float(rng.uniform(0.85, 1.0)), float(rng.uniform(0.75, 1.0))))
+    dist_prim = stage.GetPrimAtPath("/World/Lights/DistantLight")
+    dist = UsdLux.DistantLight(dist_prim)
+    dist.GetIntensityAttr().Set(float(rng.uniform(200, 2500)))
+    xf = UsdGeom.Xformable(dist_prim)
+    xf.ClearXformOpOrder()
+    # keep the sun steep so the car's shadow stays compact (the background-
+    # difference gate excludes a limited zone around the car)
+    xf.AddRotateXYZOp().Set(Gf.Vec3f(
+        float(rng.uniform(-75, -45)), float(rng.uniform(-180, 180)), 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Capture loop
+# ---------------------------------------------------------------------------
+def capture_frame():
+    rgba = camera.get_rgba()
+    depth = camera.get_depth()
+    if rgba is None or depth is None or np.asarray(rgba).size == 0:
+        return None, None
+    if rgba.dtype == np.uint8:
+        rgb_bgr = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
+    else:
+        rgb_bgr = cv2.cvtColor(
+            (np.clip(rgba[:, :, :3], 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    depth_clean = np.where(np.isfinite(depth), depth, 0.0)
+    depth_mm = np.clip(depth_clean * 1000.0, 0, args.max_depth_mm).astype(np.uint16)
+    return rgb_bgr, depth_mm
+
+
+# Hiding spot for the background capture: BELOW the ground plane, where the
+# car is optically sealed off (under the tabletop it stays visible between
+# the table legs and shades the floor).
+HIDE_XY = (0.60, -0.30)
+HIDE_Z_BOTTOM = -0.6
+
+# ---------------------------------------------------------------------------
+# Freshness beacon: the RGB annotator lags scene changes by an arbitrary,
+# sometimes very large number of renders (depth is prompt) — the root cause
+# of every phantom-car artifact. A small cube pinned in the image corner
+# changes color each capture phase; an RGB readback is provably fresh exactly
+# when the beacon shows the phase's color. The final saved capture is taken
+# with the beacon HIDDEN and verified gone.
+# ---------------------------------------------------------------------------
+BEACON_PATH = "/World/FreshnessBeacon"
+BEACON_PX = (24, 24)
+_bdir_cam = np.array([(BEACON_PX[0] - CX) / FX, (BEACON_PX[1] - CY) / FY, 1.0])
+_bdir_w = CAM_R @ _bdir_cam
+BEACON_POS = CAM_T + _bdir_w / np.linalg.norm(_bdir_w) * 0.35
+_beacon_cube = UsdGeom.Cube.Define(stage_live, BEACON_PATH)
+_beacon_cube.CreateSizeAttr(0.02)
+UsdGeom.Xformable(_beacon_cube.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(*BEACON_POS))
+_beacon_color_attr = _beacon_cube.CreateDisplayColorAttr()
+_beacon_img = UsdGeom.Imageable(_beacon_cube.GetPrim())
+
+BEACON_COLORS = {"red": (1.0, 0.0, 0.0), "green": (0.0, 1.0, 0.0)}
+
+
+def beacon_show(name):
+    _beacon_color_attr.Set([Gf.Vec3f(*BEACON_COLORS[name])])
+    _beacon_img.MakeVisible()
+
+
+def beacon_hide():
+    _beacon_img.MakeInvisible()
+
+
+def beacon_reads(img_bgr, name):
+    """Does the beacon patch show the given color (dominant channel test)?"""
+    u, v = BEACON_PX
+    patch = img_bgr[max(0, v - 8):v + 8, max(0, u - 8):u + 8].astype(float)
+    b, g, r = patch[..., 0].mean(), patch[..., 1].mean(), patch[..., 2].mean()
+    if name == "red":
+        return r > g + 25 and r > b + 25
+    return g > r + 25 and g > b + 25
+
+
+def capture_validated(center_xy, yaw):
+    """Ghost-proof capture: for each frame, first hide the car UNDER the
+    table and capture a car-free background, then place the car and capture
+    again. Accept only when:
+      - depth: the window at the labeled pixel contains a surface at or
+        closer than the car's expected optical-axis depth (tilt-aware), and
+      - rgb: pixels that differ from the background are confined to the car's
+        neighbourhood — any ghost / stale copy / frozen accumulation artifact
+        ANYWHERE else in the image is a difference outside that region and
+        forces a retry with more renders.
+    This is renderer-agnostic: it detects bad frames by construction instead
+    of trusting any particular accumulation setting."""
+    car_img = UsdGeom.Imageable(stage_live.GetPrimAtPath(CAR))
+
+    def step_render(subframes):
+        rep.orchestrator.step(rt_subframes=subframes, delta_time=0.0,
+                              pause_timeline=True)
+
+    def capture_when(pred, subframes, tries=8):
+        """Step + capture until pred(rgb) says the readback is fresh."""
+        for _ in range(tries):
+            step_render(subframes)
+            rgb, depth = capture_frame()
+            if rgb is not None and pred(rgb):
+                return rgb, depth
+        return None, None
+
+    for attempt in range(4):
+        sub = 8 + attempt * 8
+        # phase 1: car hidden + beacon RED -> a capture showing RED is a
+        # provably fresh car-free background
+        car_img.MakeInvisible()
+        set_car_center(HIDE_XY, 0.0, z_bottom=HIDE_Z_BOTTOM)
+        beacon_show("red")
+        bg_bgr, _ = capture_when(lambda im: beacon_reads(im, "red"), sub)
+        if bg_bgr is None:
+            log(f"  gate: no fresh RED background (attempt {attempt + 1})")
+            continue
+
+        # phase 2: car revealed at target + beacon GREEN -> fresh reveal
+        center = set_car_center(center_xy, yaw)
+        u, v, cam_depth = project_to_pixel(center)
+        iu, iv = int(round(u)), int(round(v))
+        car_img.MakeVisible()
+        beacon_show("green")
+        probe, _ = capture_when(lambda im: beacon_reads(im, "green"), sub)
+        if probe is None:
+            log(f"  gate: no fresh GREEN reveal (attempt {attempt + 1})")
+            continue
+
+        # phase 3: beacon hidden -> a capture showing NEITHER color is the
+        # fresh, beacon-free image that gets saved
+        beacon_hide()
+        rgb_bgr, depth_mm = capture_when(
+            lambda im: not beacon_reads(im, "green") and not beacon_reads(im, "red"),
+            sub)
+        if rgb_bgr is None:
+            log(f"  gate: beacon did not disappear (attempt {attempt + 1})")
+            continue
+
+        win = depth_mm[max(0, iv - 30):iv + 31,
+                       max(0, iu - 30):iu + 31].astype(float)
+        valid = win[win > 0] / 1000.0
+        depth_ok = (valid.size and 0.1 < float(valid.min()) < cam_depth + 0.02)
+
+        g_now = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        g_bg = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        changed = np.abs(g_now - g_bg) > 10
+        ys, xs = np.mgrid[0:changed.shape[0], 0:changed.shape[1]]
+        car_zone = (xs - u) ** 2 + (ys - v) ** 2 < 130 ** 2  # car + shadow + reflection
+        beacon_zone = ((xs - BEACON_PX[0]) ** 2 + (ys - BEACON_PX[1]) ** 2 < 45 ** 2)
+        outside = float(changed[~car_zone & ~beacon_zone].mean())
+        core = changed[max(0, iv - 35):iv + 36, max(0, iu - 35):iu + 36]
+        car_visible = float(core.mean()) > 0.06
+        if depth_ok and car_visible and outside < 0.01 and float(rgb_bgr.mean()) >= 5.0:
+            return rgb_bgr, depth_mm, center, u, v, cam_depth, float(valid.min())
+        log(f"  gate: depth_ok={depth_ok} car_visible={car_visible} "
+            f"outside_frac={outside:.4f} (attempt {attempt + 1})")
     return None
 
 
-def _discover_nucleus_assets():
-    """Discover available assets from Nucleus server."""
-    available = []
-    try:
-        import omni.client
-        nucleus_server = _try_get_nucleus_server()
-        if nucleus_server is None:
-            log("No Nucleus server found — skipping Nucleus asset discovery")
-            return available
-
-        for search_dir in NUCLEUS_SEARCH_DIRS:
-            full_path = nucleus_server + search_dir
-            result, entries = omni.client.list(full_path)
-            if result == omni.client.Result.OK:
-                for entry in entries:
-                    if entry.relative_path.endswith(".usd") or entry.relative_path.endswith(".usda"):
-                        available.append(search_dir + entry.relative_path)
-        log(f"Discovered {len(available)} Nucleus assets")
-    except Exception as e:
-        log(f"Nucleus asset discovery failed: {e}")
-    return available
-
-
-def _add_nucleus_reference(stage, prim_path, asset_path, nucleus_server=None):
-    """Add a USD reference from Nucleus to the stage."""
-    try:
-        prim = stage.DefinePrim(prim_path)
-        if nucleus_server:
-            prim.GetReferences().AddReference(nucleus_server + asset_path)
-        else:
-            prim.GetReferences().AddReference(asset_path)
-        return True
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Procedural warehouse (fallback when no USD is provided)
-# ---------------------------------------------------------------------------
-def _build_procedural_warehouse(stage, arena_size):
-    def _add_box(path, center, size, color=(0.5, 0.5, 0.5)):
-        cube = UsdGeom.Cube.Define(stage, path)
-        cube.AddTranslateOp().Set(Gf.Vec3f(*center))
-        cube.AddScaleOp().Set(Gf.Vec3f(*(s / 2.0 for s in size)))
-        cube.CreateDisplayColorAttr([Gf.Vec3f(*color)])
-        UsdPhysics.CollisionAPI.Apply(stage.GetPrimAtPath(path))
-
-    S = arena_size
-    wall_h, wall_t = 4.0, 0.3
-    _add_box("/World/Env/WallN", (0, S, wall_h / 2), (2 * S, wall_t, wall_h), (0.6, 0.6, 0.55))
-    _add_box("/World/Env/WallS", (0, -S, wall_h / 2), (2 * S, wall_t, wall_h), (0.6, 0.6, 0.55))
-    _add_box("/World/Env/WallE", (S, 0, wall_h / 2), (wall_t, 2 * S, wall_h), (0.6, 0.6, 0.55))
-    _add_box("/World/Env/WallW", (-S, 0, wall_h / 2), (wall_t, 2 * S, wall_h), (0.6, 0.6, 0.55))
-
-    rng = np.random.default_rng(42)
-    for i in range(6):
-        x = rng.uniform(-S * 0.7, S * 0.7)
-        y = rng.uniform(-S * 0.7, S * 0.7)
-        h = rng.uniform(1.5, 3.5)
-        w = rng.uniform(2.0, 5.0)
-        d = rng.uniform(0.5, 1.0)
-        color = tuple(rng.uniform(0.3, 0.8, size=3))
-        _add_box(f"/World/Env/Shelf_{i}", (x, y, h / 2), (w, d, h), color)
-
-
-# ---------------------------------------------------------------------------
-# Lighting randomization
-# ---------------------------------------------------------------------------
-_light_prims = []
-
-
-def _setup_lights(stage):
-    """Create a set of lights that we'll randomize."""
-    global _light_prims
-    _light_prims = []
-
-    # Dome light for ambient / HDR environment lighting
-    dome_path = "/World/Lights/DomeLight"
-    dome = UsdLux.DomeLight.Define(stage, dome_path)
-    dome.CreateIntensityAttr(1000.0)
-    dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
-    _light_prims.append(("dome", dome_path))
-
-    # Distant light (sun-like)
-    dist_path = "/World/Lights/DistantLight"
-    dist = UsdLux.DistantLight.Define(stage, dist_path)
-    dist.CreateIntensityAttr(3000.0)
-    dist.CreateColorAttr(Gf.Vec3f(1.0, 0.95, 0.9))
-    xform = UsdGeom.Xformable(stage.GetPrimAtPath(dist_path))
-    xform.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 30.0, 0.0))
-    _light_prims.append(("distant", dist_path))
-
-    # Several point/spot lights at random positions
-    for i in range(4):
-        ppath = f"/World/Lights/PointLight_{i}"
-        pl = UsdLux.SphereLight.Define(stage, ppath)
-        pl.CreateIntensityAttr(5000.0)
-        pl.CreateRadiusAttr(0.1)
-        pl.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
-        xf = UsdGeom.Xformable(stage.GetPrimAtPath(ppath))
-        xf.AddTranslateOp().Set(Gf.Vec3f(0.0, 0.0, 3.0))
-        _light_prims.append(("point", ppath))
-
-    log(f"Created {len(_light_prims)} lights for randomization")
-
-
-def _randomize_lighting(stage, rng):
-    """Randomize all light properties."""
-    for ltype, lpath in _light_prims:
-        prim = stage.GetPrimAtPath(lpath)
-        if not prim.IsValid():
-            continue
-
-        if ltype == "dome":
-            light = UsdLux.DomeLight(prim)
-            # Randomize intensity (wide range for different ambient levels)
-            light.GetIntensityAttr().Set(rng.uniform(200, 5000))
-            # Randomize color temperature (warm to cool)
-            r = rng.uniform(0.7, 1.0)
-            g = rng.uniform(0.7, 1.0)
-            b = rng.uniform(0.7, 1.0)
-            light.GetColorAttr().Set(Gf.Vec3f(float(r), float(g), float(b)))
-            # Randomize dome rotation for different ambient direction
-            xform = UsdGeom.Xformable(prim)
-            xform.ClearXformOpOrder()
-            xform.AddRotateYOp().Set(float(rng.uniform(0, 360)))
-
-        elif ltype == "distant":
-            light = UsdLux.DistantLight(prim)
-            light.GetIntensityAttr().Set(rng.uniform(500, 8000))
-            r = rng.uniform(0.8, 1.0)
-            g = rng.uniform(0.75, 1.0)
-            b = rng.uniform(0.7, 1.0)
-            light.GetColorAttr().Set(Gf.Vec3f(float(r), float(g), float(b)))
-            # Randomize sun angle
-            xform = UsdGeom.Xformable(prim)
-            xform.ClearXformOpOrder()
-            xform.AddRotateXYZOp().Set(Gf.Vec3f(
-                float(rng.uniform(-80, -10)),
-                float(rng.uniform(-180, 180)),
-                0.0,
-            ))
-
-        elif ltype == "point":
-            light = UsdLux.SphereLight(prim)
-            light.GetIntensityAttr().Set(rng.uniform(500, 15000))
-            light.GetRadiusAttr().Set(float(rng.uniform(0.05, 0.5)))
-            r = rng.uniform(0.6, 1.0)
-            g = rng.uniform(0.6, 1.0)
-            b = rng.uniform(0.6, 1.0)
-            light.GetColorAttr().Set(Gf.Vec3f(float(r), float(g), float(b)))
-            # Randomize position
-            xform = UsdGeom.Xformable(prim)
-            xform.ClearXformOpOrder()
-            xform.AddTranslateOp().Set(Gf.Vec3f(
-                float(rng.uniform(-args.arena_size * 0.8, args.arena_size * 0.8)),
-                float(rng.uniform(-args.arena_size * 0.8, args.arena_size * 0.8)),
-                float(rng.uniform(1.5, 5.0)),
-            ))
-
-            # Randomly enable/disable some lights for variety
-            if rng.random() < 0.3:
-                light.GetIntensityAttr().Set(0.0)
-
-
-# ---------------------------------------------------------------------------
-# Material randomization
-# ---------------------------------------------------------------------------
-_material_cache = {}
-
-
-def _create_random_material(stage, mat_path, rng):
-    """Create a UsdPreviewSurface material with random properties."""
-    mat = UsdShade.Material.Define(stage, mat_path)
-    shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
-    shader.CreateIdAttr("UsdPreviewSurface")
-
-    # Random diffuse color
-    r, g, b = rng.uniform(0.05, 0.95, size=3)
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-        Gf.Vec3f(float(r), float(g), float(b))
-    )
-
-    # Random roughness
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
-        float(rng.uniform(0.1, 1.0))
-    )
-
-    # Random metallic
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(
-        float(rng.choice([0.0, 0.0, 0.0, 0.5, 0.9]))  # mostly non-metallic
-    )
-
-    # Connect shader to material
-    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-
-    return mat
-
-
-def _apply_random_material(stage, prim_path, rng, mat_index):
-    """Apply a random material to a prim."""
-    mat_path = f"/World/Materials/RandomMat_{mat_index:04d}"
-    if mat_path not in _material_cache:
-        _material_cache[mat_path] = _create_random_material(stage, mat_path, rng)
-    mat = _material_cache[mat_path]
-    UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(prim_path)).Bind(mat)
-
-
-# ---------------------------------------------------------------------------
-# Random object spawning (primitives + Nucleus meshes)
-# ---------------------------------------------------------------------------
-def _spawn_random_objects(stage, num_objects, arena_size, rng, nucleus_assets=None):
-    """Spawn diverse objects at random positions with random materials."""
-    shape_types = ["Cube", "Cylinder", "Sphere", "Cone", "Capsule"]
-    object_paths = []
-
-    # Decide how many will be Nucleus mesh assets vs primitives
-    num_nucleus = 0
-    if nucleus_assets:
-        num_nucleus = min(num_objects // 3, len(nucleus_assets))
-
-    nucleus_server = None
-    if num_nucleus > 0:
-        nucleus_server = _try_get_nucleus_server()
-
-    for i in range(num_objects):
-        path = f"/World/Objects/Obj_{i:03d}"
-
-        x = float(rng.uniform(-arena_size * 0.8, arena_size * 0.8))
-        y = float(rng.uniform(-arena_size * 0.8, arena_size * 0.8))
-        scale = float(rng.uniform(0.1, 0.8))
-        z = scale
-
-        use_nucleus = (i < num_nucleus) and nucleus_assets
-        if use_nucleus:
-            asset_path = rng.choice(nucleus_assets)
-            success = _add_nucleus_reference(stage, path, asset_path, nucleus_server)
-            if not success:
-                use_nucleus = False
-
-        if not use_nucleus:
-            shape = rng.choice(shape_types)
-            if shape == "Cube":
-                prim = UsdGeom.Cube.Define(stage, path)
-            elif shape == "Cylinder":
-                prim = UsdGeom.Cylinder.Define(stage, path)
-            elif shape == "Sphere":
-                prim = UsdGeom.Sphere.Define(stage, path)
-            elif shape == "Cone":
-                prim = UsdGeom.Cone.Define(stage, path)
-            else:  # Capsule
-                prim = UsdGeom.Capsule.Define(stage, path)
-
-        # Transform
-        xform = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-        xform.ClearXformOpOrder()
-        xform.AddTranslateOp().Set(Gf.Vec3f(x, y, z))
-
-        # Anisotropic random scale
-        sx = scale * float(rng.uniform(0.5, 2.0))
-        sy = scale * float(rng.uniform(0.5, 2.0))
-        sz = scale * float(rng.uniform(0.5, 2.0))
-        xform.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
-
-        # Random rotation
-        xform.AddRotateXYZOp().Set(Gf.Vec3f(
-            float(rng.uniform(0, 360)),
-            float(rng.uniform(0, 360)),
-            float(rng.uniform(0, 360)),
-        ))
-
-        # Apply random material
-        _apply_random_material(stage, path, rng, i)
-
-        # Physics
-        UsdPhysics.RigidBodyAPI.Apply(stage.GetPrimAtPath(path))
-        UsdPhysics.CollisionAPI.Apply(stage.GetPrimAtPath(path))
-
-        object_paths.append(path)
-
-    return object_paths
-
-
-def _rerandomize_objects(stage, object_paths, arena_size, rng):
-    """Re-randomize positions, scales, rotations, and materials of existing objects."""
-    for idx, path in enumerate(object_paths):
-        prim = stage.GetPrimAtPath(path)
-        if not prim.IsValid():
-            continue
-
-        xform = UsdGeom.Xformable(prim)
-        xform.ClearXformOpOrder()
-
-        x = float(rng.uniform(-arena_size * 0.8, arena_size * 0.8))
-        y = float(rng.uniform(-arena_size * 0.8, arena_size * 0.8))
-        scale = float(rng.uniform(0.1, 0.8))
-        z = scale
-
-        xform.AddTranslateOp().Set(Gf.Vec3f(x, y, z))
-        sx = scale * float(rng.uniform(0.5, 2.0))
-        sy = scale * float(rng.uniform(0.5, 2.0))
-        sz = scale * float(rng.uniform(0.5, 2.0))
-        xform.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
-        xform.AddRotateXYZOp().Set(Gf.Vec3f(
-            float(rng.uniform(0, 360)),
-            float(rng.uniform(0, 360)),
-            float(rng.uniform(0, 360)),
-        ))
-
-        # Re-randomize material with some probability
-        if rng.random() < 0.5:
-            new_mat_idx = int(rng.integers(0, 200))
-            _apply_random_material(stage, path, rng, new_mat_idx)
-
-
-# ---------------------------------------------------------------------------
-# Camera random walk
-# ---------------------------------------------------------------------------
-class _CameraRandomWalk:
-    def __init__(self, arena_size=15.0, height_range=(0.5, 2.5), dt=1 / 30,
-                 max_speed=1.5, direction_change_rate=0.3):
-        self.arena = arena_size * 0.75
-        self.h_min, self.h_max = height_range
-        self.dt = dt
-        self.max_speed = max_speed
-        self.dir_rate = direction_change_rate
-        self.rng = np.random.default_rng()
-
-        self.pos = np.array([0.0, 0.0, np.mean(height_range)])
-        self.vel = self.rng.uniform(-0.5, 0.5, size=3)
-        self.yaw = 0.0
-        self.pitch = -0.1
-        self.yaw_vel = 0.0
-        self.pitch_vel = 0.0
-
-    def reset(self):
-        """Reset to a new random starting position and orientation."""
-        self.pos = np.array([
-            self.rng.uniform(-self.arena * 0.5, self.arena * 0.5),
-            self.rng.uniform(-self.arena * 0.5, self.arena * 0.5),
-            self.rng.uniform(self.h_min, self.h_max),
-        ])
-        self.vel = self.rng.uniform(-0.5, 0.5, size=3)
-        self.yaw = self.rng.uniform(0, 2 * math.pi)
-        self.pitch = self.rng.uniform(-0.4, 0.1)
-        self.yaw_vel = 0.0
-        self.pitch_vel = 0.0
-
-    def step(self):
-        rng = self.rng
-        dt = self.dt
-
-        accel = rng.normal(0, 1.5, size=3)
-        self.vel += accel * dt
-        speed = np.linalg.norm(self.vel)
-        if speed > self.max_speed:
-            self.vel *= self.max_speed / speed
-
-        self.pos += self.vel * dt
-        self.pos[0] = np.clip(self.pos[0], -self.arena, self.arena)
-        self.pos[1] = np.clip(self.pos[1], -self.arena, self.arena)
-        self.pos[2] = np.clip(self.pos[2], self.h_min, self.h_max)
-
-        for i in range(2):
-            if abs(self.pos[i]) >= self.arena * 0.95:
-                self.vel[i] *= -0.5
-        if self.pos[2] <= self.h_min + 0.1 or self.pos[2] >= self.h_max - 0.1:
-            self.vel[2] *= -0.5
-
-        self.yaw_vel += rng.normal(0, self.dir_rate) * dt
-        self.yaw_vel *= 0.95
-        self.yaw += self.yaw_vel
-
-        self.pitch_vel += rng.normal(0, self.dir_rate * 0.5) * dt
-        self.pitch_vel *= 0.95
-        self.pitch = np.clip(self.pitch + self.pitch_vel, -0.6, 0.3)
-
-        euler_deg = np.array([0.0, math.degrees(self.pitch), math.degrees(self.yaw)])
-        quat = rot_utils.euler_angles_to_quats(euler_deg, degrees=True)
-
-        return self.pos.copy(), quat
-
-
-# ---------------------------------------------------------------------------
-# Save intrinsics
-# ---------------------------------------------------------------------------
-def _save_intrinsics(output_dir, width, height, camera):
-    try:
-        intrinsic_matrix = camera.get_intrinsics_matrix()
-        fx = intrinsic_matrix[0, 0]
-        fy = intrinsic_matrix[1, 1]
-        cx = intrinsic_matrix[0, 2]
-        cy = intrinsic_matrix[1, 2]
-    except Exception:
-        fov_h = 69.4
-        fx = fy = width / (2.0 * math.tan(math.radians(fov_h / 2)))
-        cx = width / 2.0
-        cy = height / 2.0
-
-    path = output_dir / "intrinsics.txt"
-    with open(path, "w") as f:
-        f.write("Color Camera Intrinsics:\n")
-        f.write(f"  Width: {width}\n")
-        f.write(f"  Height: {height}\n")
-        f.write(f"  fx: {fx:.4f}\n")
-        f.write(f"  fy: {fy:.4f}\n")
-        f.write(f"  cx: {cx:.4f}\n")
-        f.write(f"  cy: {cy:.4f}\n")
-        f.write(f"\nDepth Scale: 0.001\n")
-        f.write(f"\nSource: Isaac Sim (synthetic, diverse domain randomization)\n")
-    log(f"Saved intrinsics to {path}")
-
-
-def _resolution_for_aspect(aspect, base_width):
-    """Pick an (even) (width, height) for a target width/height aspect ratio,
-    using base_width as the resolution budget."""
-    width = int(round(base_width / 2.0)) * 2
-    height = int(round((base_width / aspect) / 2.0)) * 2
-    return max(width, 2), max(height, 2)
-
-
-def _set_camera_fov(stage, prim_path, fov_h_deg, width, height):
-    """Set the USD camera's aperture/focal so its horizontal FOV matches
-    fov_h_deg, with square pixels for the given resolution.
-
-    FOV depends only on aperture/focal ratio, so absolute units are irrelevant.
-    """
-    cam = UsdGeom.Camera(stage.GetPrimAtPath(prim_path))
-    focal = 24.0
-    h_aperture = 2.0 * focal * math.tan(math.radians(fov_h_deg) / 2.0)
-    v_aperture = h_aperture * (height / float(width))  # square pixels
-    cam.GetFocalLengthAttr().Set(focal)
-    cam.GetHorizontalApertureAttr().Set(h_aperture)
-    cam.GetVerticalApertureAttr().Set(v_aperture)
-
-
-def _scene_intrinsics(camera, width, height, fov_h_deg):
-    """Return {fx, fy, cx, cy, width, height} for the current camera, reading
-    back the actual intrinsics with a FOV-based fallback."""
-    try:
-        m = camera.get_intrinsics_matrix()
-        fx, fy = float(m[0, 0]), float(m[1, 1])
-        cx, cy = float(m[0, 2]), float(m[1, 2])
-    except Exception:
-        fx = fy = width / (2.0 * math.tan(math.radians(fov_h_deg) / 2.0))
-        cx, cy = width / 2.0, height / 2.0
-    return {"fx": fx, "fy": fy, "cx": cx, "cy": cy,
-            "width": int(width), "height": int(height)}
-
-
-# ---------------------------------------------------------------------------
-# Scene loading
-# ---------------------------------------------------------------------------
-def _load_scene(usd_path, arena_size, rng, num_objects, nucleus_assets):
-    """Load a USD scene (or build procedural one), spawn objects and lights."""
-    import omni.usd as omni_usd
-    import omni.kit.app as omni_app
-
-    stage = omni_usd.get_context().get_stage()
-
-    if usd_path:
-        resolved = usd_path
-        if not resolved.startswith(("http://", "https://", "omniverse://", "/")):
-            resolved = str(Path(resolved).resolve())
-        log(f"Loading USD scene: {resolved}")
-        omni_usd.get_context().open_stage(resolved)
-        omni_app.get_app().update()
-        omni_app.get_app().update()
-        stage = omni_usd.get_context().get_stage()
-        world = World(stage_units_in_meters=1.0)
-    else:
-        world = World(stage_units_in_meters=1.0)
-        world.scene.add_default_ground_plane()
-        _build_procedural_warehouse(stage, arena_size)
-
-    # Setup lights
-    _setup_lights(stage)
-
-    # Spawn objects
-    object_paths = _spawn_random_objects(stage, num_objects, arena_size, rng, nucleus_assets)
-
-    return world, stage, object_paths
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     project_root = Path(__file__).resolve().parent.parent
-    rng = np.random.default_rng()
-
-    # ---- Output dirs ----
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "collected_dataset" / f"isaac_{timestamp}"
-
+        output_dir = project_root / "collected_dataset" / f"kuka_{timestamp}"
     rgb_dir = output_dir / "rgb"
     depth_dir = output_dir / "depth"
     rgb_dir.mkdir(parents=True, exist_ok=True)
     depth_dir.mkdir(parents=True, exist_ok=True)
     log(f"Output: {output_dir}")
 
-    # ---- Discover Nucleus assets ----
-    nucleus_assets = None
-    if args.use_nucleus_assets:
-        nucleus_assets = _discover_nucleus_assets()
-        if not nucleus_assets:
-            # Fall back to the known asset paths list
-            nucleus_assets = NUCLEUS_ASSET_PATHS
-            log(f"Using {len(nucleus_assets)} predefined Nucleus asset paths")
+    setup_lights()
+    if args.light_randomize_interval:
+        randomize_lighting()
 
-    # ---- Scene list ----
-    scenes = args.usd_paths if args.usd_paths else [""]
-    num_scenes = len(scenes)
+    num_frames = 8 if args.test else args.num_frames
+    intrinsics_meta = {}
+    labels = {}
 
-    if args.frames_per_scene > 0:
-        frames_per_scene = args.frames_per_scene
-    else:
-        frames_per_scene = max(1, args.num_frames // num_scenes)
 
-    log(f"Scenes: {scenes if scenes[0] else ['<procedural>']}")
-    log(f"Frames per scene: {frames_per_scene}")
+    for i in range(num_frames):
+        if not simulation_app.is_running():
+            break
+        if (args.light_randomize_interval and i > 0
+                and i % args.light_randomize_interval == 0):
+            randomize_lighting()
 
-    # ---- Camera walk state ----
-    cam_state = _CameraRandomWalk(
-        arena_size=args.arena_size,
-        height_range=args.camera_height_range,
-        dt=1.0 / args.fps,
-    )
+        result = None
+        for pose_attempt in range(3):
+            xy = sample_car_xy()
+            yaw = float(rng.uniform(-np.pi, np.pi)) if args.random_yaw else 0.0
+            result = capture_validated(xy, yaw)
+            if result is not None:
+                break
+            log(f"frame {i}: capture gate failed, resampling pose "
+                f"(attempt {pose_attempt + 1})")
+        if result is None:
+            raise RuntimeError(
+                f"frame {i}: could not produce a clean validated frame — "
+                "renderer/scene issue, aborting instead of saving bad labels")
+        rgb_bgr, depth_mm, center, u, v, cam_depth, win_min = result
 
-    # ---- Collection ----
-    frame_count = 0      # actual frames saved (drives the num_frames budget)
-    name_index = 0       # number embedded in the filename (gets a gap per scene)
-    scene_idx = 0
-    intrinsics_meta = {}  # filename stem -> per-scene intrinsics dict
+        stem = f"{i:06d}"
+        cv2.imwrite(str(rgb_dir / f"{stem}.png"), rgb_bgr)
+        cv2.imwrite(str(depth_dir / f"{stem}.png"), depth_mm)
+        intrinsics_meta[stem] = INTR
 
-    while frame_count < args.num_frames and simulation_app.is_running():
-        usd_path = scenes[scene_idx % num_scenes]
-        scene_label = usd_path if usd_path else "<procedural>"
-        log(f"\n=== Scene {scene_idx + 1}: {scene_label} ===")
+        if i < 6:
+            # human-viewable previews: RGB | colorized depth side by side
+            # (the raw depth PNGs are uint16 millimetres and look black in
+            # normal image viewers)
+            preview_dir = output_dir / "preview"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            dv = depth_mm.astype(float)
+            valid = dv > 0
+            norm = np.zeros(dv.shape, dtype=np.uint8)
+            if valid.any() and dv[valid].max() > dv[valid].min():
+                lo, hi = dv[valid].min(), dv[valid].max()
+                norm[valid] = (255 * (dv[valid] - lo) / (hi - lo)).astype(np.uint8)
+            dcol = cv2.applyColorMap(255 - norm, cv2.COLORMAP_TURBO)
+            cv2.imwrite(str(preview_dir / f"{stem}.png"),
+                        np.concatenate([rgb_bgr, dcol], axis=1))
+        labels[stem] = {
+            "car_center_world": [float(center[0]), float(center[1]), float(center[2])],
+            "car_yaw_world": yaw,
+            "car_center_px": [u, v],
+            "car_center_cam_depth_m": cam_depth,
+            "table_top_z": float(TABLE_TOP_Z),
+        }
 
-        # Load scene
-        world, stage, object_paths = _load_scene(
-            usd_path, args.arena_size, rng, args.num_objects, nucleus_assets
-        )
+        if args.test:
+            log(f"  test frame {stem}: car world ({center[0]:+.3f},{center[1]:+.3f}) "
+                f"px ({int(round(u))},{int(round(v))}) car min depth {win_min:.3f} "
+                f"(validated)")
+        elif (i + 1) % 100 == 0:
+            log(f"  {i + 1}/{num_frames} frames collected")
 
-        # --- Per-scene camera randomization: FOV + aspect ratio ---
-        scene_fov = float(rng.uniform(args.fov_range[0], args.fov_range[1]))
-        scene_aspect = float(rng.choice(args.aspect_ratios))
-        scene_w, scene_h = _resolution_for_aspect(scene_aspect, args.width)
-        log(f"Camera: FOV={scene_fov:.1f} deg, aspect={scene_aspect:.3f}, "
-            f"resolution={scene_w}x{scene_h}")
-
-        # Create camera at the sampled resolution
-        camera = Camera(
-            prim_path="/World/DepthCamera",
-            position=np.array([0.0, 0.0, 1.5]),
-            frequency=args.fps,
-            resolution=(scene_w, scene_h),
-        )
-        world.reset()
-        camera.initialize()
-        camera.add_distance_to_image_plane_to_frame()
-
-        # Apply the sampled FOV to the camera prim
-        _set_camera_fov(stage, "/World/DepthCamera", scene_fov, scene_w, scene_h)
-
-        # Let physics settle
-        log("Letting physics settle...")
-        for _ in range(60):
-            world.step(render=True)
-
-        # Read back the actual intrinsics for this scene's camera
-        scene_intr = _scene_intrinsics(camera, scene_w, scene_h, scene_fov)
-
-        # Reset camera walk for new scene
-        cam_state.reset()
-
-        # Randomize lighting initially
-        _randomize_lighting(stage, rng)
-
-        # Collect frames for this scene
-        scene_frames = 0
-        remaining = args.num_frames - frame_count
-
-        target_frames = min(frames_per_scene, remaining)
-
-        while scene_frames < target_frames and simulation_app.is_running():
-            # Periodic randomizations
-            if scene_frames > 0 and scene_frames % args.light_randomize_interval == 0:
-                _randomize_lighting(stage, rng)
-
-            if scene_frames > 0 and scene_frames % args.object_randomize_interval == 0:
-                _rerandomize_objects(stage, object_paths, args.arena_size, rng)
-                # Let physics settle briefly after rerandomization
-                for _ in range(10):
-                    world.step(render=True)
-
-            # Update camera pose
-            position, orientation = cam_state.step()
-            camera.set_world_pose(position=position, orientation=orientation)
-
-            world.step(render=True)
-
-            # Get sensor data
-            rgba = camera.get_rgba()
-            depth = camera.get_depth()
-
-            if rgba is None or depth is None:
-                continue
-
-            # RGB
-            if rgba.dtype == np.uint8:
-                rgb_bgr = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
-            else:
-                rgb_bgr = cv2.cvtColor(
-                    (np.clip(rgba[:, :, :3], 0, 1) * 255).astype(np.uint8),
-                    cv2.COLOR_RGB2BGR,
-                )
-
-            # Depth → uint16 mm
-            depth_clean = np.where(np.isfinite(depth), depth, 0.0)
-            depth_mm = np.clip(depth_clean * 1000.0, 0, args.max_depth_mm).astype(np.uint16)
-
-            stem = f"{name_index:06d}"
-            fname = f"{stem}.png"
-            cv2.imwrite(str(rgb_dir / fname), rgb_bgr)
-            cv2.imwrite(str(depth_dir / fname), depth_mm)
-            intrinsics_meta[stem] = scene_intr
-
-            frame_count += 1
-            scene_frames += 1
-            name_index += 1
-
-            if frame_count % 100 == 0:
-                log(f"  {frame_count}/{args.num_frames} frames collected "
-                    f"(scene: {scene_label}, scene_frame: {scene_frames}/{target_frames})")
-
-        # Numbering gap between scenes so each scene is a separate sequence.
-        name_index += args.scene_gap
-        scene_idx += 1
-
-    # ---- Save intrinsics ----
-    # Per-frame intrinsics (machine-readable; used by split_dataset/SequenceDataset)
+    # ---- Metadata (same files/format as the original collector) ----
     with open(output_dir / "intrinsics.json", "w") as f:
         json.dump(intrinsics_meta, f)
-    log(f"Saved per-frame intrinsics for {len(intrinsics_meta)} frames to "
-        f"{output_dir / 'intrinsics.json'}")
-    # Human-readable summary for the last scene's camera
-    _save_intrinsics(output_dir, scene_w, scene_h, camera)
+    with open(output_dir / "labels.json", "w") as f:
+        json.dump(labels, f, indent=1)
+    with open(output_dir / "intrinsics.txt", "w") as f:
+        f.write("Color Camera Intrinsics:\n")
+        f.write(f"  Width: {WIDTH}\n  Height: {HEIGHT}\n")
+        f.write(f"  fx: {FX:.4f}\n  fy: {FY:.4f}\n  cx: {CX:.4f}\n  cy: {CY:.4f}\n")
+        f.write("\nDepth Scale: 0.001\n")
+        f.write("\nCamera extrinsics (ROS optical frame, world coords):\n")
+        f.write(f"  position: {CAM_T.tolist()}\n")
+        f.write(f"  rotation matrix (optical->world):\n{CAM_R}\n")
+        f.write("\nSource: Isaac Sim (KUKA table scene, fixed D455 overhead camera)\n")
 
-    log(f"\nDone! {frame_count} frames saved to {output_dir}")
-    log(f"Scenes used: {num_scenes}")
-    log("Run split_dataset.py next to create train/val/test splits.")
+    log(f"\nDone! {len(intrinsics_meta)} frames saved to {output_dir}")
+    if args.test:
+        # every saved frame passed capture_validated (car rendered at its
+        # labeled pixel); a systemic failure would have aborted with an error
+        log("TEST RESULT: PASS (all frames validated: car rendered at its GT pixel)")
+    else:
+        log("Run RealDepth's split_dataset.py next to create train/val/test splits.")
 
-    simulation_app.close()
+    # simulation_app.close() can hang/terminate mid-teardown (see CLAUDE.md);
+    # everything is written, so flush and hard-exit.
+    sys.stderr.flush()
+    import os
+    os._exit(0)
 
 
 if __name__ == "__main__":
@@ -820,4 +627,5 @@ if __name__ == "__main__":
         sys.stderr.write(f"\n\nFATAL ERROR: {e}\n")
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
-        simulation_app.close()
+        import os
+        os._exit(2)

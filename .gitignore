@@ -1,0 +1,18 @@
+# Generated datasets (thousands of PNGs — regenerate with scripts/collect_isaac_sim.py)
+collected_dataset/kuka_v1/
+collected_dataset/kuka_v2/
+collected_dataset/kuka_v3/
+collected_dataset/kuka_v4/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Dataset archives are too big for GitHub (100 MB file limit)
+collected_dataset/*.zip

@@ -49,7 +49,17 @@ Source assets live in this repo under `3d_model/` (`car_object_arlan_usd.usdz`, 
 
 ## Scripts
 
-- `scripts/pick_place.py` — stage 1: IK pick-and-place loop, car randomized on the table each cycle, magnetic grip modeled as kinematic attach (car has no rigid body). `--headless --cycles N --seed S`; prints per-cycle PASS/FAIL and exits nonzero on failure.
+- `scripts/pick_place.py` — stage 1: IK pick-and-place loop, car randomized on the table each cycle, magnetic grip modeled as kinematic attach (car has no rigid body), always placed into the tray fixture in a fixed orientation. `--headless --cycles N --seed S`; prints per-cycle PASS/FAIL and exits nonzero on failure.
+- `scripts/collect_isaac_sim.py` — stage 2: RGB + depth dataset from a fixed overhead D455-geometry camera (adapted from RealDepth's collector; same output layout: `rgb/`, `depth/` uint16 mm, `intrinsics.json/txt`, plus `labels.json` with GT car pose + pixel). Render-only (physics never stepped, arm stays parked). `--headless --num_frames N --seed S`; `--test` runs an 8-frame self-check.
+
+## Camera/rendering traps (found in stage 2)
+
+- A freshly created USD `Camera` prim falls back to `clippingRange (1, 1e6)` — a **1-meter near plane** that silently clips away the whole table scene from a ~0.5 m overhead camera. Always author `clippingRange`.
+- `isaacsim.sensors.camera.Camera`: constructor `orientation` is routed through `set_world_pose(camera_axes="world")` (+X forward, +Z up), NOT raw USD. Camera pose must be set before `world.reset()` or the renderer may not pick it up.
+- **Motion blur renders teleported objects as semi-transparent copies at BOTH positions** (huge instantaneous "velocity" smeared over the shutter). Depth AOVs are not motion blurred, so depth looks clean while RGB shows ghost cars. Disable motion blur AND move objects while `MakeInvisible()`, reveal after.
+- **The RGB annotator readback lags scene changes by an arbitrary, sometimes huge number of renders** (depth is prompt). Extra `world.render()` calls don't help — once "converged" they can be no-ops. Differential checks are blind when both compared captures share the stale state. The working pattern (see `capture_validated` in the collector): a "freshness beacon" cube pinned in the image corner changes color each phase (red = background, green = reveal, hidden = final); a readback is provably fresh exactly when the beacon shows the expected state. Sync renders with `rep.orchestrator.step(rt_subframes=N, delta_time=0.0, pause_timeline=True)`.
+- The collector renders with **path tracing** (`/rtx/rendermode PathTracing`, 256 spp, temporal OptiX denoiser off) — the RTX real-time mode's temporal denoiser/AA add further history artifacts on top of the above.
+- `stage.Traverse()` on a stage handle captured before `World()` can miss later-created prims; re-fetch via `omni.usd.get_context().get_stage()`.
 
 ## Conventions
 

@@ -1,7 +1,9 @@
 """KUKA KR10 R1100-2 pick-and-place of the toy car in Isaac Sim 5.1.
 
 Stage 1 of the project (see readme.md / CLAUDE.md):
-  - The toy car appears at a random location on the table each cycle.
+  - The toy car appears at a random location on the table each cycle, always
+    in its authored (tray-fitting) orientation — the vision model only
+    outputs position, so orientation must stay known.
   - The arm moves by kinematics (resolved-rate Jacobian IK on position drives).
   - The magnetic end effector points straight down, "magnets" the car on
     contact (modeled as a kinematic attach — the car mesh has no rigid body),
@@ -421,7 +423,11 @@ print(f"[setup] ready posture q = {np.round(Q_READY, 3)}", flush=True)
 results = []
 for cycle in range(args.cycles):
     xy = random_car_xy(cycle)
-    yaw = rng.uniform(-np.pi, np.pi)
+    # The vision model only outputs position, so in the real system the car's
+    # orientation must be known a priori: it always spawns in the authored
+    # (tray-fitting) orientation. The yaw task during the carry still holds it
+    # there against any drift.
+    yaw = 0.0
     center = set_car_center(xy, yaw)
     print(f"[cycle {cycle}] car at ({center[0]:+.3f}, {center[1]:+.3f}), "
           f"yaw {np.degrees(yaw):+.0f} deg", flush=True)
